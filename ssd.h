@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+#ifndef _NVMEVIRT_SSD_H
+#define _NVMEVIRT_SSD_H
+
+#include <linux/types.h>
+#include "pqueue/pqueue.h"
+#include "ssd_config.h"
+#include "channel_model.h"
+/*
+	Default malloc size (when sector size is 512B)
+	Channel = 40 * 8 = 320
+	LUN     = 40 * 8 = 320
+	Plane   = 16 * 1 = 16
+	Block   = 32 * 256 = 8192
+	Page    = 16 * 256 = 4096
+	Sector  = 4 * 8 = 32
+
+	Line    = 40 * 256 = 10240
+	maptbl  = 8 * 4194304 = 33554432
+	rmap    = 8 * 4194304 = 33554432
+*/
+
+#define INVALID_PPA (~(0ULL))
+#define INVALID_LPN (~(0ULL))
+#define UNMAPPED_PPA (~(0ULL))
+
+enum nand_operations {
+	NAND_READ = 0,
+	NAND_WRITE = 1,
+	NAND_ERASE = 2,
+	NAND_NOP = 3,
+};
+
+enum io_types {
+	USER_IO = 0,
+	GC_IO = 1,
+	MIGRATE_IO = 2,
+	MAP_READ_IO = 3, // do not use in write operations
+};
+
+enum page_status {
+	SEC_FREE = 0,
+	SEC_INVALID = 1,
+	SEC_VALID = 2,
+
+	PG_FREE = 0,
+	PG_INVALID = 1,
+	PG_VALID = 2
+};
+
+enum data_hotness {
+	NOTEMP = 0,
+	HOT = 1,
+	WARM = 2,
+	COLD = 3,
+	GC = 4,
+};
+
+/* Cell type */
+enum cell_types { CELL_TYPE_LSB,
+				  CELL_TYPE_MSB,
+				  CELL_TYPE_CSB,
+				  CELL_TYPE_TSB,
+				  MAX_CELL_TYPES };
+
+#define TOTAL_PPA_BITS (64)
+#define BLK_BITS (16)
+#define PAGE_BITS (16)
+#define PL_BITS (8)
+#define LUN_BITS (8)
+#define CH_BITS (8)
+#define RSB_BITS (TOTAL_PPA_BITS - (BLK_BITS + PAGE_BITS + PL_BITS + LUN_BITS + CH_BITS))
+
+#define CONZONE_MAP_BITS (2)
+#define CONZONE_MAP_RSV_BITS (1)
+#define CONZONE_RSV_BITS \
+	(TOTAL_PPA_BITS - (BLK_BITS + PAGE_BITS + PL_BITS + LUN_BITS + CH_BITS + CONZONE_MAP_BITS + CONZONE_MAP_RSV_BITS))
+
+/* describe a physical page addr */
+struct ppa {
+	union {
+		struct {
+			uint64_t pg : PAGE_BITS; // pg == 4KB
+			uint64_t blk : BLK_BITS;
+			uint64_t pl : PL_BITS;
+			uint64_t lun : LUN_BITS;
+			uint64_t ch : CH_BITS;
+			uint64_t rsv : RSB_BITS;
+		} g;
+
+		struct {
+			uint64_t : PAGE_BITS;
+			uint64_t blk_in_ssd : BLK_BITS + PL_BITS + LUN_BITS + CH_BITS;
+			uint64_t rsv : RSB_BITS;
+		} h;
+
+		struct {
+			uint64_t pg : PAGE_BITS; // pg == 4KB
+			uint64_t blk : BLK_BITS;
+			uint64_t pl : PL_BITS;
+			uint64_t lun : LUN_BITS;
+			uint64_t ch : CH_BITS;
+			uint64_t map : CONZONE_MAP_BITS;
+			uint64_t map_rsv : CONZONE_MAP_RSV_BITS;
+			uint64_t rsv : CONZONE_RSV_BITS;
+		} zms;
+
+		uint64_t ppa;
+	};
+};
+
+#define RSV_PPA ((struct ppa){.zms.map_rsv = 1})
+#define IS_RSV_PPA(p) ((p).zms.map_rsv == 1)
+
+struct nand_cmd {
+	int type;
+	int cmd;
+	uint64_t xfer_size; // byte
+	uint64_t stime;		/* Coperd: request arrival time */
+	bool interleave_pci_dma;
+	struct ppa ppa;
+	struct list_head entry;
+	uint64_t ctime; // complete time
+};
+
+typedef int nand_sec_status_t;
+
+struct nand_page {
+	nand_sec_status_t *sec;
+	int nsecs;
+	int status;
+};
+
+struct nand_block {
+	struct nand_page *pg;
+	int npgs;
+	int ipc; /* invalid page count */
+	int vpc; /* valid page count */
+	int erase_cnt;
+	int wp; /* current write pointer */
+	int nand_type;
+	int used_pgs;
+};
+
+struct nand_plane {
+	struct nand_block *blk;
+	uint64_t next_pln_avail_time;
+	int nblks;
+#if (BASE_SSD == CONZONE_PROTOTYPE)
+	bool busy;
+	struct list_head cmd_queue_head;
+	uint64_t cmd_queue_depth;
+	uint64_t max_cmd_queue_depth;
+	bool migrating;
+	uint64_t migrating_etime;
+#endif
+};
+
+struct nand_lun {
+	struct nand_plane *pl;
+	int npls;
+	uint64_t next_lun_avail_time;
+	bool busy;
+	uint64_t gc_endtime;
+	bool migrating;
+	uint64_t migrating_etime;
+	struct list_head cmd_queue_head;
+	uint64_t cmd_queue_depth;
+	uint64_t max_cmd_queue_depth;
+};
+
+struct ssd_channel {
+	struct nand_lun *lun;
+	int nluns;
+	uint64_t gc_endtime;
+	struct channel_model *perf_model;
+};
+
+struct ssd_pcie {
+	struct channel_model *perf_model;
+};
+
+struct buffer {
+	size_t size;
+	size_t remaining;
+	spinlock_t lock;
+	int ns_type;
+	int zid;
+	uint64_t tt_lpns;
+	uint64_t *lpns; // for flush
+	uint64_t pgs;	// for flush
+	uint32_t sqid;	// for flush
+	bool busy;
+	size_t flush_data;
+	size_t capacity; // avaliable buffer size
+	uint64_t time;	 // for flush bandwidth
+};
+
+/*
+pg (page): Mapping unit (4KB)
+flashpg (flash page) : Nand sensing unit , tR
+oneshotpg (oneshot page) : Nand program unit, tPROG, (eg. flashpg * 3 (TLC))
+blk (block): Nand erase unit
+lun (die) : Nand operation unit
+ch (channel) : Nand <-> SSD controller data transfer unit
+*/
+struct ssdparams {
+	int secsz;					 /* sector size in bytes */
+	int secs_per_pg;			 /* # of sectors per page */
+	int pgsz;					 /* mapping unit size in bytes*/
+	int pgs_per_flashpg;		 /* # of pgs per flash page */
+	uint64_t flashpgs_per_blk;	 /* # of flash pages per block */
+	uint64_t pgs_per_oneshotpg;	 /* # of pgs per oneshot page */
+	uint64_t oneshotpgs_per_blk; /* # of oneshot pages per block */
+	uint64_t pgs_per_blk;		 /* # of pages per block */
+	uint64_t blks_per_pl;		 /* # of blocks per plane */
+	int pls_per_lun;			 /* # of planes per LUN (Die) */
+	int luns_per_ch;			 /* # of LUNs per channel */
+	int nchs;					 /* # of channels in the SSD */
+	int cell_mode;
+
+	/* Unit size of NVMe write command
+	   Transfer size should be multiple of it */
+	int write_unit_size;
+	bool write_early_completion;
+
+	int pg_4kb_rd_lat[MAX_CELL_MODE][MAX_CELL_TYPES]; /* NAND page 4KB read latency in nanoseconds.
+														 sensing time (half tR) */
+	int pg_rd_lat[MAX_CELL_MODE]
+				 [MAX_CELL_TYPES]; /* NAND page read latency in nanoseconds. sensing time (tR) */
+	int pg_wr_lat[MAX_CELL_MODE];  /* NAND page program latency in nanoseconds. pgm time (tPROG)*/
+	int blk_er_lat;				   /* NAND block erase latency in nanoseconds. erase time (tERASE) */
+	int max_ch_xfer_size;
+
+	int fw_4kb_rd_lat;	/* Firmware overhead of 4KB read of read in nanoseconds */
+	int fw_rd_lat;		/* Firmware overhead of read of read in nanoseconds */
+	int fw_wbuf_lat0;	/* Firmware overhead0 of write buffer in nanoseconds */
+	int fw_wbuf_lat1;	/* Firmware overhead1 of write buffer in nanoseconds */
+	int fw_ch_xfer_lat; /* Firmware overhead of nand channel data transfer(4KB) in nanoseconds */
+
+	uint64_t ch_bandwidth;	 /*NAND CH Maximum bandwidth in MiB/s*/
+	uint64_t pcie_bandwidth; /*PCIE Maximum bandwidth in MiB/s*/
+
+	/* below are all calculated values */
+	unsigned long secs_per_blk; /* # of sectors per block */
+	unsigned long secs_per_pl;	/* # of sectors per plane */
+	unsigned long secs_per_lun; /* # of sectors per LUN */
+	unsigned long secs_per_ch;	/* # of sectors per channel */
+	unsigned long tt_secs;		/* # of sectors in the SSD */
+
+	unsigned long pgs_per_pl;  /* # of pages per plane */
+	unsigned long pgs_per_lun; /* # of pages per LUN (Die) */
+	unsigned long pgs_per_ch;  /* # of pages per channel */
+	unsigned long tt_pgs;	   /* total # of pages in the SSD */
+
+	unsigned long blks_per_lun; /* # of blocks per LUN */
+	unsigned long blks_per_ch;	/* # of blocks per channel */
+	unsigned long tt_blks;		/* total # of blocks in the SSD */
+
+	unsigned long secs_per_line;
+	unsigned long pgs_per_line;
+	unsigned long blks_per_line;
+	unsigned long tt_lines;
+
+	unsigned long pls_per_ch; /* # of planes per channel */
+	unsigned long tt_pls;	  /* total # of planes in the SSD */
+
+	unsigned long tt_luns; /* total # of LUNs in the SSD */
+
+	unsigned long long write_buffer_size;
+	unsigned long line_groups;
+
+#if (BASE_SSD == CONZONE_PROTOTYPE)
+	uint64_t blksz; /* chunk mapping unit in bytes*/
+	uint64_t pslc_blksz;
+	uint64_t pslc_pgs_per_oneshotpg; /* # of pgs per oneshot pSLC page*/
+	uint64_t pslc_flashpgs_per_blk;
+	uint64_t pslc_pgs_per_flashpg;
+	uint64_t pslc_pgs_per_blk;
+	uint64_t pslc_pgs_per_line;
+	uint64_t pslc_blks;
+	uint64_t meta_pslc_blks;
+	uint64_t meta_normal_blks;
+#endif
+};
+
+struct l2pcache_ent {
+	int nsid;
+	uint64_t lpn;
+	int granularity;
+	int resident;
+	int next; // for LRU
+	int last;
+};
+
+struct l2pcache {
+	int size;
+	int num_slots;
+	int slot_size;
+	int *slot_len;
+	int *tail;
+	int *head;
+	int evict_policy;
+	struct l2pcache_ent **mapping; // only record cached lpns
+};
+
+struct ssd {
+	struct ssdparams sp;
+	struct ssd_channel *ch;
+	struct ssd_pcie *pcie;
+	struct buffer *write_buffer;
+	unsigned int cpu_nr_dispatcher;
+	struct l2pcache l2pcache;
+};
+
+static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
+{
+	return &(ssd->ch[ppa->g.ch]);
+}
+
+static inline struct nand_lun *get_lun(struct ssd *ssd, struct ppa *ppa)
+{
+	struct ssd_channel *ch = get_ch(ssd, ppa);
+	return &(ch->lun[ppa->g.lun]);
+}
+
+static inline struct nand_plane *get_pl(struct ssd *ssd, struct ppa *ppa)
+{
+	struct nand_lun *lun = get_lun(ssd, ppa);
+	return &(lun->pl[ppa->g.pl]);
+}
+
+static inline struct nand_block *get_blk(struct ssd *ssd, struct ppa *ppa)
+{
+	struct nand_plane *pl = get_pl(ssd, ppa);
+	return &(pl->blk[ppa->g.blk]);
+}
+
+static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa)
+{
+	struct nand_block *blk = get_blk(ssd, ppa);
+	return &(blk->pg[ppa->g.pg]);
+}
+
+static inline uint32_t get_cell(struct ssd *ssd, struct ppa *ppa)
+{
+	struct ssdparams *spp = &ssd->sp;
+	return (ppa->g.pg / spp->pgs_per_flashpg) % (spp->cell_mode);
+}
+
+void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts);
+void ssd_init(struct ssd *ssd, struct ssdparams *spp, uint32_t cpu_nr_dispatcher);
+void ssd_remove(struct ssd *ssd);
+
+uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd);
+uint64_t ssd_advance_pcie(struct ssd *ssd, uint64_t request_time, uint64_t length);
+uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64_t length);
+uint64_t ssd_next_idle_time(struct ssd *ssd);
+
+void buffer_init(struct buffer *buf, size_t size);
+uint32_t buffer_allocate(struct buffer *buf, size_t size);
+#if (BASE_SSD == CONZONE_PROTOTYPE)
+bool is_buffer_busy(struct buffer *buf);
+#endif
+bool buffer_release(struct buffer *buf, size_t size);
+void buffer_refill(struct buffer *buf);
+void buffer_remove(struct buffer *buf);
+
+void adjust_ftl_latency(int target, int lat);
+#endif
