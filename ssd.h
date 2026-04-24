@@ -1,5 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/**
+ * ssd.h - NAND hardware abstraction layer
+ *
+ * Models the internal structure of a NAND-flash SSD from the bottom up:
+ *
+ *   Sector (LBA_SIZE bytes)
+ *     -> Page (4 KiB logical mapping unit)
+ *       -> Flash page (sensing unit, tR latency)
+ *         -> Oneshot page (program unit, tPROG latency; = flash_page * cell_mode for TLC)
+ *           -> Block (erase unit)
+ *             -> Plane (independent program/erase within a LUN)
+ *               -> LUN/Die (NAND chip, unit of parallelism)
+ *                 -> Channel (data bus shared among LUNs)
+ *
+ * A "superblock" (line) spans one block per LUN across a stripe of DIES_PER_ZONE dies
+ * and is the unit of garbage collection.  For CONZONE_PROTOTYPE each line spans
+ * DIES_PER_ZONE * PLNS_PER_LUN blocks (multi-plane interleave).
+ *
+ * The performance model (ssd_advance_nand, ssd_advance_pcie) computes the
+ * simulated completion timestamp for each NAND command by maintaining per-plane
+ * (or per-LUN for other models) next-available-time values.
+ */
+
 #ifndef _NVMEVIRT_SSD_H
 #define _NVMEVIRT_SSD_H
 
@@ -77,7 +100,18 @@ enum cell_types { CELL_TYPE_LSB,
 #define CONZONE_RSV_BITS \
 	(TOTAL_PPA_BITS - (BLK_BITS + PAGE_BITS + PL_BITS + LUN_BITS + CH_BITS + CONZONE_MAP_BITS + CONZONE_MAP_RSV_BITS))
 
-/* describe a physical page addr */
+/**
+ * struct ppa - physical page address (packed into 64 bits)
+ *
+ * Three views of the same 64-bit value:
+ *   g   - standard fields: ch, lun, pl, blk, pg
+ *   h   - blk_in_ssd: block index flattened across all planes/LUNs/channels
+ *   zms - ConZone extension: adds a 2-bit map-granularity tag used by the
+ *         L2P cache to distinguish page/chunk/zone-level mapping entries.
+ *
+ * UNMAPPED_PPA (~0ULL) means the logical page has no physical mapping yet.
+ * RSV_PPA (.zms.map_rsv=1) marks a reserved/in-progress mapping slot.
+ */
 struct ppa {
 	union {
 		struct {
@@ -113,6 +147,12 @@ struct ppa {
 #define RSV_PPA ((struct ppa){.zms.map_rsv = 1})
 #define IS_RSV_PPA(p) ((p).zms.map_rsv == 1)
 
+/**
+ * struct nand_cmd - a single NAND operation issued to the performance model
+ *
+ * Passed to ssd_advance_nand() which updates the per-plane (or per-LUN)
+ * availability timestamps and returns the simulated completion time.
+ */
 struct nand_cmd {
 	int type;
 	int cmd;
@@ -181,6 +221,16 @@ struct ssd_pcie {
 	struct channel_model *perf_model;
 };
 
+/**
+ * struct buffer - write buffer shared between the host write path and FTL flush
+ *
+ * For CONZONE_PROTOTYPE the buffer operates in a "busy" mode: only one zone
+ * may use the buffer at a time (busy flag).  For other models the buffer tracks
+ * remaining capacity in bytes.
+ *
+ * When a buffer is flushed to NAND, the lpns array records which logical page
+ * numbers are stored so the FTL can update the L2P table after the flush.
+ */
 struct buffer {
 	size_t size;
 	size_t remaining;
@@ -197,14 +247,18 @@ struct buffer {
 	uint64_t time;	 // for flush bandwidth
 };
 
-/*
-pg (page): Mapping unit (4KB)
-flashpg (flash page) : Nand sensing unit , tR
-oneshotpg (oneshot page) : Nand program unit, tPROG, (eg. flashpg * 3 (TLC))
-blk (block): Nand erase unit
-lun (die) : Nand operation unit
-ch (channel) : Nand <-> SSD controller data transfer unit
-*/
+/**
+ * struct ssdparams - fully-derived NAND geometry and timing parameters
+ *
+ * Populated once by ssd_init_params() from the compile-time ssd_config.h
+ * constants.  All "calculated values" fields at the bottom are derived from
+ * the primary geometry fields above them.
+ *
+ * Hierarchy sizes:   sector -> page -> flashpg -> oneshotpg -> blk -> pl -> lun -> ch
+ * Latency model:     pg_rd_lat[cell_mode][cell_type]  (tR, depends on cell position)
+ *                    pg_wr_lat[cell_mode]              (tPROG)
+ *                    blk_er_lat                        (tERASE)
+ */
 struct ssdparams {
 	int secsz;					 /* sector size in bytes */
 	int secs_per_pg;			 /* # of sectors per page */
@@ -294,6 +348,16 @@ struct l2pcache_ent {
 	int last;
 };
 
+/**
+ * struct l2pcache - in-DRAM L2P mapping cache (CONZONE_PROTOTYPE only)
+ *
+ * Caches the most recently accessed L2P entries to avoid full maptbl lookups.
+ * Uses a hash-slotted structure: lpn % num_slots determines the slot, and
+ * within each slot an LRU list of size slot_size is maintained.
+ *
+ * Cache entries can store mappings at different granularities (PAGE_MAP,
+ * CHUNK_MAP, etc.) to take advantage of spatial locality.
+ */
 struct l2pcache {
 	int size;
 	int num_slots;

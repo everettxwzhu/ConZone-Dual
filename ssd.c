@@ -149,6 +149,16 @@ static void check_params(struct ssdparams *spp)
 	// ftl_assert(is_power_of_2(spp->nchs));
 }
 
+/**
+ * ssd_init_params - derive all SSD geometry parameters from ssd_config.h constants
+ * @spp: output parameter struct to populate
+ * @capacity: total physical capacity of this partition in bytes
+ * @nparts: number of partitions (channels are divided evenly among partitions)
+ *
+ * Computes the complete NAND geometry tree (sectors -> pages -> blocks -> LUNs -> channels)
+ * and loads all latency/bandwidth values from the compile-time configuration.
+ * For CONZONE_PROTOTYPE also computes pSLC-specific geometry (pslc_pgs_per_blk, etc.).
+ */
 void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 {
 	uint64_t blk_size, total_size, meta_size;
@@ -631,6 +641,17 @@ uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64
 	return nsecs_latest;
 }
 
+/**
+ * lun_getstime - assign a start time to a NAND command at the LUN level
+ *
+ * For CONZONE_PROTOTYPE: implements priority preemption so that user/GC I/Os
+ * can be inserted before a pending migration I/O on the same LUN (but a
+ * different block), preserving migration isolation.  Returns true if the
+ * command was inserted via preemption (the caller must adjust subsequent
+ * commands' timestamps accordingly).
+ *
+ * For other models: simply sets ncmd->stime = max(lun->next_lun_avail_time, ncmd_stime).
+ */
 static bool lun_getstime(struct nand_lun *lun, struct nand_cmd *ncmd, uint64_t ncmd_stime)
 {
 #if (BASE_SSD == CONZONE_PROTOTYPE)
@@ -685,6 +706,12 @@ static bool lun_getstime(struct nand_lun *lun, struct nand_cmd *ncmd, uint64_t n
 #endif
 }
 
+/**
+ * lun_update - update LUN availability time after a NAND command completes
+ *
+ * If the command was preempted (preemp=true), shifts all later commands in
+ * the LUN queue by (cmd_etime - ncmd->stime) to account for the delay.
+ */
 static void lun_update(struct nand_lun *lun, struct nand_cmd *ncmd, bool preemp, uint64_t cmd_etime)
 {
 #if (BASE_SSD == CONZONE_PROTOTYPE)
@@ -809,6 +836,22 @@ static void plane_update(struct nand_plane *pl, struct nand_cmd *ncmd, bool pree
 }
 #endif
 
+/**
+ * ssd_advance_nand - simulate executing one NAND command and return completion time
+ * @ssd: the SSD device state
+ * @ncmd: the command to execute (cmd, ppa, xfer_size, stime, type)
+ *
+ * Models the full timing pipeline for each command type:
+ *   NAND_READ:  plane/LUN busy wait -> tR (cell-type dependent) -> channel transfer
+ *   NAND_WRITE: plane/LUN busy wait -> channel transfer -> tPROG
+ *   NAND_ERASE: plane/LUN busy wait -> tERASE
+ *   NAND_NOP:   advance plane/LUN time without doing anything
+ *
+ * For CONZONE_PROTOTYPE uses per-plane scheduling (plane_getstime/plane_update)
+ * to enable multi-plane parallelism.  For other models uses per-LUN scheduling.
+ *
+ * Returns the nanosecond timestamp when the command finishes.
+ */
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 {
 	int c = ncmd->cmd;

@@ -1,5 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/**
+ * nvmev.h - NVMeVirt core header file
+ *
+ * NVMeVirt is a kernel-module-based NVMe virtual device emulator. It maps a
+ * reserved physical memory region as a virtual NVMe device exposed to the OS.
+ * It supports multiple SSD models: conventional SSD (CONV), Zoned Namespace
+ * SSD (ZNS), KV-SSD, and the ConZone dual-namespace prototype specific to
+ * this project.
+ *
+ * Overall architecture:
+ *   Reserved physical memory
+ *     ├── 1 MiB metadata region (BAR registers, Doorbell registers, MSI-X table)
+ *     └── Storage region (mapped as simulated NAND storage medium)
+ *
+ *   Kernel threads
+ *     ├── nvmev_dispatcher: polls BAR register changes and Doorbells, dispatches
+ *     │     I/O requests to IO workers
+ *     └── nvmev_io_worker[N]: performs data copies and fills CQ completion entries
+ *           when the target completion timestamp is reached
+ */
+
 #ifndef _LIB_NVMEV_H
 #define _LIB_NVMEV_H
 
@@ -85,44 +106,45 @@
 
 #include "ssd_config.h"
 
+/* SQ statistics: updated by the dispatcher on each Doorbell processing pass */
 struct nvmev_sq_stat {
-	unsigned int nr_dispatched;
-	unsigned int nr_dispatch;
-	unsigned int nr_in_flight;
-	unsigned int max_nr_in_flight;
-	unsigned long long total_io;
+	unsigned int nr_dispatched;		/* total number of commands dispatched */
+	unsigned int nr_dispatch;		/* number of Doorbell processing passes (batches) */
+	unsigned int nr_in_flight;		/* commands currently in-flight (submitted but not yet completed) */
+	unsigned int max_nr_in_flight;	/* peak in-flight command count observed */
+	unsigned long long total_io;	/* cumulative bytes of I/O processed */
 };
 
 struct nvmev_submission_queue {
-	int qid;
-	int cqid;
-	int priority;
-	bool phys_contig;
+	int qid;       /* queue identifier */
+	int cqid;      /* associated completion queue ID */
+	int priority;  /* queue scheduling priority */
+	bool phys_contig; /* true if the queue memory is physically contiguous */
 
-	int queue_size;
+	int queue_size; /* number of entries in the queue */
 
 	struct nvmev_sq_stat stat;
 
-	struct nvme_command __iomem **sq;
+	struct nvme_command __iomem **sq; /* array of pointers to mapped SQ entries */
 };
 
 struct nvmev_completion_queue {
-	int qid;
-	int irq_vector;
-	bool irq_enabled;
-	bool interrupt_ready;
-	bool phys_contig;
+	int qid;           /* queue identifier */
+	int irq_vector;    /* MSI-X vector number for this CQ */
+	bool irq_enabled;  /* whether IRQ delivery is enabled for this CQ */
+	bool interrupt_ready; /* true when a new completion is ready to trigger an IRQ */
+	bool phys_contig;  /* true if the queue memory is physically contiguous */
 
-	spinlock_t entry_lock;
-	struct mutex irq_lock;
+	spinlock_t entry_lock; /* protects CQ head/tail and entry writes */
+	struct mutex irq_lock; /* serializes IRQ signaling across workers */
 
-	int queue_size;
+	int queue_size; /* number of entries in the queue */
 
-	int phase;
-	int cq_head;
-	int cq_tail;
+	int phase;    /* phase bit: toggles each time the head wraps around */
+	int cq_head;  /* index of the next slot to write a completion entry */
+	int cq_tail;  /* index last seen by the host driver (updated via CQ doorbell) */
 
-	struct nvme_completion __iomem **cq;
+	struct nvme_completion __iomem **cq; /* array of pointers to mapped CQ entries */
 };
 
 struct nvmev_admin_queue {
@@ -146,71 +168,94 @@ struct nvmev_admin_queue {
 #define SQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_SQE_PER_PAGE)
 #define CQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_CQE_PER_PAGE)
 
+/**
+ * struct nvmev_config - module-level configuration loaded from kernel module params
+ *
+ * The storage area begins at memmap_start + 1 MiB; the first 1 MiB is
+ * reserved for the virtual BAR, doorbell registers, and MSI-X table.
+ */
 struct nvmev_config {
-	unsigned long memmap_start; // byte
-	unsigned long memmap_size;	// byte
+	unsigned long memmap_start; /* physical start address of the reserved memory (bytes) */
+	unsigned long memmap_size;  /* total size of the reserved memory region (bytes) */
 
-	unsigned long storage_start; // byte
-	unsigned long storage_size;	 // byte
+	unsigned long storage_start; /* physical start of the usable storage area (= memmap_start + 1MiB) */
+	unsigned long storage_size;  /* usable storage size (= memmap_size - 1MiB) */
 
-	unsigned int cpu_nr_dispatcher;
-	unsigned int nr_io_workers;
-	unsigned int cpu_nr_io_workers[32];
+	unsigned int cpu_nr_dispatcher;      /* CPU core pinned to the dispatcher thread */
+	unsigned int nr_io_workers;          /* number of IO worker threads */
+	unsigned int cpu_nr_io_workers[32];  /* CPU core pinned to each IO worker */
 
-	/* TODO Refactoring storage configurations */
-	unsigned int nr_io_units;
-	unsigned int io_unit_shift; // 2^
+	/* I/O unit configuration for parallel storage simulation */
+	unsigned int nr_io_units;    /* number of parallel I/O units */
+	unsigned int io_unit_shift;  /* I/O unit size = 2^io_unit_shift bytes */
 
-	unsigned int read_delay;	 // ns
-	unsigned int read_time;		 // ns
-	unsigned int read_trailing;	 // ns
-	unsigned int write_delay;	 // ns
-	unsigned int write_time;	 // ns
-	unsigned int write_trailing; // ns
+	/* Emulated device latency model: total latency = delay + time * (size/unit) + trailing */
+	unsigned int read_delay;	 /* read command overhead (ns) */
+	unsigned int read_time;		 /* per-unit read transfer time (ns) */
+	unsigned int read_trailing;	 /* read completion tail latency (ns) */
+	unsigned int write_delay;	 /* write command overhead (ns) */
+	unsigned int write_time;	 /* per-unit write transfer time (ns) */
+	unsigned int write_trailing; /* write completion tail latency (ns) */
 };
 
+/**
+ * struct nvmev_io_work - a single pending I/O request tracked by an IO worker
+ *
+ * Work entries form a doubly-linked list sorted by nsecs_target inside each
+ * IO worker's work_queue array. The list uses array indices rather than
+ * pointers to avoid dynamic allocation overhead.
+ */
 struct nvmev_io_work {
-	int sqid;
-	int cqid;
+	int sqid;     /* submission queue ID that originated this request */
+	int cqid;     /* completion queue ID to post the result to */
 
-	int sq_entry;
-	unsigned int command_id;
+	int sq_entry;          /* index of the SQ entry (command slot) */
+	unsigned int command_id; /* NVMe command_id field, echoed in the CQE */
 
-	unsigned long long nsecs_start;
-	unsigned long long nsecs_target;
+	unsigned long long nsecs_start;      /* wall-clock time when the command was received (ns) */
+	unsigned long long nsecs_target;     /* simulated completion time (ns) */
 
-	unsigned long long nsecs_enqueue;
-	unsigned long long nsecs_copy_start;
-	unsigned long long nsecs_copy_done;
-	unsigned long long nsecs_cq_filled;
+	/* Debug/profiling timestamps (only populated with PERF_DEBUG) */
+	unsigned long long nsecs_enqueue;    /* time the work entry was inserted */
+	unsigned long long nsecs_copy_start; /* time data copy began */
+	unsigned long long nsecs_copy_done;  /* time data copy finished */
+	unsigned long long nsecs_cq_filled;  /* time CQE was written */
 
-	bool is_copied;
-	bool is_completed;
+	bool is_copied;    /* true after the host-memory data copy is complete */
+	bool is_completed; /* true after the CQE has been posted (or buffer released) */
 
-	unsigned int status;
-	unsigned int result0;
-	unsigned int result1;
+	unsigned int status;  /* NVMe status code to report in the CQE */
+	unsigned int result0; /* command-specific result DW0 */
+	unsigned int result1; /* command-specific result DW1 */
 
-	bool is_internal;
-	void *write_buffer;
-	size_t buffs_to_release;
+	/* For internal (FTL-generated) operations such as write-buffer flushes */
+	bool is_internal;           /* true: this is an internal FTL op, not a host command */
+	void *write_buffer;         /* pointer to the write buffer to release on completion */
+	size_t buffs_to_release;    /* number of buffer bytes to release */
 
-	unsigned int next, prev;
+	unsigned int next, prev; /* index links for the sorted doubly-linked list */
 };
 
+/**
+ * struct nvmev_io_worker - one IO completion worker thread and its work queue
+ *
+ * The work_queue is a statically allocated ring of NR_MAX_PARALLEL_IO entries.
+ * Free entries are chained via free_seq/free_seq_end; in-flight entries are
+ * chained by nsecs_target order via io_seq/io_seq_end.
+ */
 struct nvmev_io_worker {
-	struct nvmev_io_work *work_queue;
+	struct nvmev_io_work *work_queue; /* flat array of all work slots */
 
-	unsigned int free_seq;	   /* free io req head index */
-	unsigned int free_seq_end; /* free io req tail index */
-	unsigned int io_seq;	   /* io req head index */
-	unsigned int io_seq_end;   /* io req tail index */
+	unsigned int free_seq;     /* index of the first free slot (free list head) */
+	unsigned int free_seq_end; /* index of the last free slot (free list tail) */
+	unsigned int io_seq;       /* index of the earliest-deadline in-flight entry (list head) */
+	unsigned int io_seq_end;   /* index of the latest-deadline in-flight entry (list tail) */
 
-	unsigned long long latest_nsecs;
+	unsigned long long latest_nsecs; /* wall-clock time of the last processed completion */
 
-	unsigned int id;
-	struct task_struct *task_struct;
-	char thread_name[32];
+	unsigned int id;                   /* worker index (0-based) */
+	struct task_struct *task_struct;   /* the kthread running nvmev_io_worker() */
+	char thread_name[32];              /* "nvmev_io_worker_N" */
 };
 
 struct nvmev_dev {
@@ -274,22 +319,27 @@ struct nvmev_result {
 	uint64_t nsecs_target;
 };
 
+/**
+ * struct nvmev_ns - one NVMe namespace
+ *
+ * Each namespace has its own FTL instance(s) and a set of I/O command
+ * handler callbacks registered at initialization time.
+ */
 struct nvmev_ns {
-	uint32_t id;
-	uint32_t csi;
-	uint64_t size;
-	void *mapped;
+	uint32_t id;   /* 0-based namespace index */
+	uint32_t csi;  /* Command Set Identifier (NVM, ZNS, …) */
+	uint64_t size; /* logical namespace size in bytes */
+	void *mapped;  /* pointer to the namespace's region in storage_mapped */
 
-	/*conv ftl or zns or kv*/
-	uint32_t nr_parts; // partitions
-	void *ftls;		   // ftl instances. one ftl per partition
+	/* FTL layout: one ftl instance per partition */
+	uint32_t nr_parts; /* number of partitions (currently always 1) */
+	void *ftls;        /* array of FTL instances; cast to conv_ftl/zns_ftl/zms_ftl */
 
-	/*io command handler*/
+	/* Primary I/O command dispatch callback - called for every NVMe I/O command */
 	bool (*proc_io_cmd)(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
 
-	/*specific CSS io command identifier*/
+	/* Optional CSS-specific command identification and execution hooks */
 	bool (*identify_io_cmd)(struct nvmev_ns *ns, struct nvme_command cmd);
-	/*specific CSS io command processor*/
 	unsigned int (*perform_io_cmd)(struct nvmev_ns *ns, struct nvme_command *cmd, uint32_t *status);
 };
 

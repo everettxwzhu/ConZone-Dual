@@ -111,7 +111,15 @@ module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
 module_param(debug, uint, 0644);
 
-// Returns true if an event is processed
+/**
+ * nvmev_proc_dbs - scan all Doorbell registers for changes and dispatch work
+ *
+ * Called by nvmev_dispatcher on every iteration.  Compares each doorbell's
+ * current value (written by the host driver) to the shadow copy (old_dbs).
+ * When a change is detected the corresponding queue processor is invoked.
+ *
+ * Returns true if at least one doorbell changed (i.e., work was dispatched).
+ */
 static bool nvmev_proc_dbs(void)
 {
 	int qid;
@@ -120,7 +128,7 @@ static bool nvmev_proc_dbs(void)
 	int old_db;
 	bool updated = false;
 
-	// Admin queue
+	// Admin queue: doorbell index 0 = SQ tail, index 1 = CQ head
 	new_db = nvmev_vdev->dbs[0];
 	if (new_db != nvmev_vdev->old_dbs[0]) {
 		nvmev_proc_admin_sq(new_db, nvmev_vdev->old_dbs[0]);
@@ -164,6 +172,17 @@ static bool nvmev_proc_dbs(void)
 	return updated;
 }
 
+/**
+ * nvmev_dispatcher - main polling loop for the virtual NVMe controller
+ *
+ * Runs as a dedicated kthread bound to a specific CPU.  On every iteration it:
+ *   1. Calls nvmev_proc_bars() to handle controller register changes (e.g., CC.EN).
+ *   2. Calls nvmev_proc_dbs() to process Doorbell register updates from the host.
+ *
+ * When no activity is observed for CONFIG_NVMEVIRT_IDLE_TIMEOUT seconds the thread
+ * yields for one jiffie to reduce CPU usage, at the cost of a brief latency spike
+ * on the next I/O arrival.
+ */
 static int nvmev_dispatcher(void *data)
 {
 	static unsigned long last_dispatched_time = 0;
@@ -188,6 +207,11 @@ static int nvmev_dispatcher(void *data)
 	return 0;
 }
 
+/**
+ * NVMEV_DISPATCHER_INIT - create and start the dispatcher kthread
+ *
+ * Pins the thread to config.cpu_nr_dispatcher if specified (-1 means no pinning).
+ */
 static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	nvmev_vdev->nvmev_dispatcher = kthread_create(nvmev_dispatcher, NULL, "nvmev_dispatcher");
@@ -204,6 +228,13 @@ static void NVMEV_DISPATCHER_FINAL(struct nvmev_dev *nvmev_vdev)
 	}
 }
 
+/**
+ * __validate_configs_arch - x86-specific check that the memmap range is reserved
+ *
+ * Ensures the requested physical address range is marked E820_TYPE_RESERVED in the
+ * BIOS memory map and is NOT usable RAM.  This prevents accidental use of live
+ * kernel memory as device storage.
+ */
 #ifdef CONFIG_X86
 static int __validate_configs_arch(void)
 {
@@ -422,6 +453,13 @@ static const struct file_operations proc_file_fops = {
 };
 #endif
 
+/**
+ * NVMEV_STORAGE_INIT - map the storage region and create /proc/nvmev entries
+ *
+ * Uses memremap(MEMREMAP_WB) so the kernel can access the reserved physical
+ * memory via a cached virtual address.  The /proc entries allow runtime tuning
+ * of latency parameters without reloading the module.
+ */
 static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	NVMEV_INFO("Storage: %#010lx-%#010lx (%lu MiB)\n", nvmev_vdev->config.storage_start,
@@ -465,6 +503,14 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 		kfree(nvmev_vdev->io_unit_stat);
 }
 
+/**
+ * __load_configs - parse module parameters and populate nvmev_config
+ *
+ * Validates all user-supplied parameters, then fills the config struct.
+ * The CPU list string (cpus="0,1,2") is parsed so that the first entry
+ * becomes the dispatcher CPU and the remaining entries are IO worker CPUs.
+ * Returns false if validation fails.
+ */
 static bool __load_configs(struct nvmev_config *config)
 {
 	bool first = true;
@@ -511,6 +557,17 @@ static bool __load_configs(struct nvmev_config *config)
 	return true;
 }
 
+/**
+ * NVMEV_NAMESPACE_INIT - allocate and initialize all configured namespaces
+ *
+ * Iterates over NR_NAMESPACES entries from ssd_config.h.  Each namespace
+ * receives a contiguous slice of the storage area whose size is either
+ * NS_CAPACITY(i) or the remainder of the storage region (when capacity == 0).
+ *
+ * For CONZONE_PROTOTYPE, zms_init_namespace() is called first to set up
+ * per-namespace metadata, then zms_realize_namespaces() wires all namespaces
+ * to a single shared SSD hardware model.
+ */
 static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned long long remaining_capacity = nvmev_vdev->config.storage_size;
@@ -619,6 +676,20 @@ static void __print_base_config(void)
 			   (NVMEV_VERSION & 0x00ff), type);
 }
 
+/**
+ * NVMeV_init - module entry point
+ *
+ * Initialization sequence:
+ *   1. Allocate and zero the global nvmev_dev structure (VDEV_INIT).
+ *   2. Parse and validate module parameters (__load_configs).
+ *   3. Map storage memory and create /proc/nvmev (NVMEV_STORAGE_INIT).
+ *   4. Initialize namespace FTLs (NVMEV_NAMESPACE_INIT).
+ *   5. Optionally configure DMA engine.
+ *   6. Create the virtual PCI bus and device (NVMEV_PCI_INIT).
+ *   7. Start IO worker threads (NVMEV_IO_WORKER_INIT).
+ *   8. Start the dispatcher thread (NVMEV_DISPATCHER_INIT).
+ *   9. Announce the device to the PCI subsystem (pci_bus_add_devices).
+ */
 static int NVMeV_init(void)
 {
 	int ret = 0;
@@ -664,6 +735,15 @@ ret_err:
 	return -EIO;
 }
 
+/**
+ * NVMeV_exit - module cleanup (reverse of NVMeV_init)
+ *
+ * Tears down in reverse order:
+ *   1. Removes the virtual PCI bus (stops driver probing).
+ *   2. Stops dispatcher and IO worker threads.
+ *   3. Removes namespace FTLs and storage mapping.
+ *   4. Frees all SQ/CQ memory and the nvmev_dev structure.
+ */
 static void NVMeV_exit(void)
 {
 	int i;

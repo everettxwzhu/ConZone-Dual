@@ -1,5 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/**
+ * zns_ftl.h - ZNS and ConZone (zms) FTL data structures and inline helpers
+ *
+ * This file is shared by two FTL implementations:
+ *
+ *   zns_ftl  (struct zns_ftl) - simple ZNS emulator for ZNS_PROTOTYPE / WD_ZN540.
+ *     Maintains zone descriptors and write pointers; no internal GC.
+ *
+ *   zms_ftl  (struct zms_ftl) - ConZone dual-namespace FTL (CONZONE_PROTOTYPE).
+ *     Adds a full L2P table, pSLC write buffer, garbage collection, and
+ *     pSLC->TLC migration.  The zms_ftl struct begins with the same fields as
+ *     zns_ftl so it can be cast to zns_ftl for shared zone-descriptor code.
+ *
+ * Key concepts:
+ *   line     - a "superblock" spanning DIES_PER_ZONE * PLNS_PER_LUN NAND blocks;
+ *              the unit of GC.  Lines are categorized as pSLC or normal (TLC/QLC).
+ *   wp       - write pointer tracking the next physical page to write.
+ *   maptbl   - logical-to-physical (L2P) mapping table, one ppa per LPN.
+ *   rmap     - reverse map (P2L), used during GC to find the LPN of a valid page.
+ *   wfc      - write-flow-control credits prevent over-filling a line before GC runs.
+ */
+
 #ifndef _NVMEVIRT_ZNS_FTL_H
 #define _NVMEVIRT_ZNS_FTL_H
 
@@ -46,7 +68,14 @@ enum {
 	UNDEFINED_NAMESPACE = 2,
 };
 
-// Zoned Namespace Command Set Specification Revision 1.1a
+/**
+ * struct znsparams - zone configuration parameters for zns_ftl and zms_ftl
+ *
+ * Populated once by zns_init_params() or zms_init_params() at namespace init.
+ * For CONZONE_PROTOTYPE ns_type distinguishes the three namespace flavors
+ * (META/ZONED/BLOCK) which share the same struct but differ in logical_size,
+ * write-buffer size, and pSLC block count.
+ */
 struct znsparams {
 	uint32_t nr_zones;
 	uint32_t nr_active_zones;
@@ -121,6 +150,24 @@ struct migrating_lineid {
 	size_t pos;
 };
 
+/**
+ * struct zms_line - one GC unit (superblock) in the zms_ftl
+ *
+ * A line maps to DIES_PER_ZONE * PLNS_PER_LUN NAND blocks.  Lines start on
+ * the free list, move to full when all pages are written, and are reclaimed
+ * by GC (victim selection via vpc priority queue).
+ *
+ * For lines that are operated in interleaved-sub-block mode (pSLC interleave),
+ * sub_lines points to an array of per-block sub-lines enabling finer-grained
+ * GC within the same superblock.
+ *
+ * Fields:
+ *   ipc - invalid page count (incremented on L2P updates that obsolete a page)
+ *   vpc - valid page count   (victim selection: lowest vpc => most reclaimable)
+ *   rpc - reserved page count
+ *   type - USER or INTERNAL (migration target)
+ *   parent_id - for sub-lines, the index of the parent top-level line
+ */
 struct zms_line {
 	int id;	 /* line id, the same as corresponding block id if interleave */
 	int ipc; /* invalid page count in this line */
@@ -152,6 +199,16 @@ struct zms_write_pointer {
 	uint32_t pg;
 };
 
+/**
+ * struct zms_line_mgmt - tracks all lines across the three GC states
+ *
+ * Two parallel sets of lists/queues exist: one for normal (TLC/QLC) lines and
+ * one for pSLC lines.  GC victims are selected from the victim priority queue
+ * (lowest vpc first).
+ *
+ *   free  -> (write fills pages) -> full -> (GC copies valid data) -> free
+ *                                      \--> victim (being selected for GC)
+ */
 struct zms_line_mgmt {
 	struct zms_line *lines;
 
@@ -193,6 +250,22 @@ struct zms_workspace {
 	uint64_t *gc_lpns;
 };
 
+/**
+ * struct zms_ftl - ConZone FTL instance (one per namespace)
+ *
+ * Extends zns_ftl with the full machinery needed for an internal FTL:
+ *   - maptbl / l2pcache_idx: logical-to-physical mapping table + cache index
+ *   - lm: line management (free/full/victim lists for normal and pSLC lines)
+ *   - wp / gc_wp: normal write pointer and GC write pointer
+ *   - pslc_wp / pslc_gc_wp: pSLC write and GC write pointers
+ *   - wfc / pslc_wfc: write-flow-control credit counters
+ *   - rmap: reverse (P2L) mapping stored in simulated OOB
+ *   - zone_agg_lpns: per-zone aggregation buffer for pSLC->TLC migration
+ *   - migrating_line_pq: priority queue ordering lines for migration by write order
+ *
+ * Statistic counters at the end are printed by zms_print_statistic_info() on
+ * module unload to report WAF, RAF, GC counts, L2P miss rates, etc.
+ */
 struct zms_ftl {
 	struct ssd *ssd;
 
@@ -283,7 +356,9 @@ struct zms_ftl {
 	struct kmem_cache *cmd_cache;
 };
 
-/* zns internal functions */
+/* ---- Zone address translation helpers ---- */
+
+/* Return a pointer into storage for the start of zone zid */
 static inline void *get_storage_addr_from_zid(struct zns_ftl *zns_ftl, uint64_t zid)
 {
 	return (void *)((char *)zns_ftl->storage_base_addr + zid * zns_ftl->zp.zone_size);

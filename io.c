@@ -48,6 +48,23 @@ static inline size_t __cmd_io_size(struct nvme_rw_command *cmd)
 	return (cmd->length + 1) << LBA_BITS;
 }
 
+/**
+ * __do_perform_io - copy data between host memory (PRP list) and storage
+ * @sqid: submission queue that owns the command
+ * @sq_entry: index of the NVMe command within the SQ
+ *
+ * Walks the NVMe PRP (Physical Region Page) list embedded in the command to
+ * locate host memory buffers, then memcpy()s data to/from the emulated storage
+ * region.  The PRP list can be:
+ *   prp1 only   - transfer fits in one page
+ *   prp1+prp2   - transfer spans two pages
+ *   prp1+prp2 (pointer to list) - prp2 points to a page of 64-bit PRP entries
+ *
+ * For writes: host memory -> nvmev_vdev->ns[nsid].mapped + offset
+ * For reads:  nvmev_vdev->ns[nsid].mapped + offset -> host memory
+ *
+ * Returns the total number of bytes transferred.
+ */
 static unsigned int __do_perform_io(int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -209,18 +226,23 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	return length;
 }
 
+/**
+ * __insert_req_sorted - insert a work entry into the IO worker's sorted pending list
+ * @entry: index of the work_queue slot to insert
+ * @worker: the IO worker that owns the list
+ * @nsecs_target: simulated completion timestamp used as sort key
+ *
+ * The pending list is sorted in ascending nsecs_target order so the worker
+ * always processes the earliest-deadline request first.  The list is
+ * implemented as an intrusive doubly-linked list using array indices (prev/next
+ * fields in nvmev_io_work) rather than pointers, avoiding dynamic allocation.
+ *
+ * Insertion is O(n) from the tail backwards; in practice n is small because
+ * most requests complete in order.
+ */
 static void __insert_req_sorted(unsigned int entry, struct nvmev_io_worker *worker,
 								unsigned long nsecs_target)
 {
-	/**
-	 * Requests are placed in @work_queue sorted by their target time.
-	 * @work_queue is statically allocated and the ordered list is
-	 * implemented by chaining the indexes of entries with @prev and @next.
-	 * This implementation is nasty but we do this way over dynamically
-	 * allocated linked list to minimize the influence of dynamic memory allocation.
-	 * Also, this O(n) implementation can be improved to O(logn) scheme with
-	 * e.g., red-black tree but....
-	 */
 	if (worker->io_seq == -1) {
 		worker->io_seq = entry;
 		worker->io_seq_end = entry;
@@ -278,6 +300,17 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned in
 	return worker;
 }
 
+/**
+ * __enqueue_io_req - allocate a work slot and enqueue a new I/O request
+ * @sqid: submission queue ID
+ * @cqid: completion queue ID for the result
+ * @sq_entry: command slot index within the SQ
+ * @nsecs_start: wall-clock time the command arrived (used to measure latency)
+ * @ret: FTL result containing nsecs_target (simulated completion time) and status
+ *
+ * Picks an IO worker (round-robin by SQ or by turn), fills in the work entry,
+ * inserts it into the sorted pending list, then wakes the worker thread.
+ */
 static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
 							 struct nvmev_result *ret)
 {
@@ -357,6 +390,14 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 	wake_up_process(worker->task_struct);
 }
 
+/**
+ * __reclaim_completed_reqs - return completed work entries to the free pool
+ *
+ * Scans the head of each worker's sorted pending list and moves all contiguous
+ * entries that are both is_completed and is_copied back to the free list.
+ * Called from the dispatcher context (nvmev_proc_io_sq) to keep the free pool
+ * replenished without requiring a separate reclaim thread.
+ */
 static void __reclaim_completed_reqs(void)
 {
 	unsigned int turn;
@@ -408,6 +449,21 @@ static void __reclaim_completed_reqs(void)
 	}
 }
 
+/**
+ * __nvmev_proc_io - dispatch one NVMe I/O command through the FTL and enqueue it
+ * @sqid: submission queue ID
+ * @sq_entry: command slot index in the SQ
+ * @io_size: output — bytes transferred (used for SQ statistics)
+ *
+ * 1. Calls ns->proc_io_cmd() which routes the command to the appropriate FTL
+ *    (conv/zns/zms) and returns a simulated completion timestamp in ret.
+ * 2. Enqueues the work entry (__enqueue_io_req) so an IO worker will perform
+ *    the actual data copy and post the CQE when nsecs_target is reached.
+ * 3. Reclaims any already-completed work entries to keep the free pool healthy.
+ *
+ * Returns true on success, false if the FTL rejected the command (e.g., zone
+ * boundary error) — the dispatcher will stop processing the current SQ batch.
+ */
 static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -533,6 +589,13 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 		cq->cq_tail = cq->queue_size - 1;
 }
 
+/**
+ * __fill_cq_result - write a completion queue entry for a finished I/O
+ *
+ * Takes the lock on cq->entry_lock to safely advance cq_head and toggle the
+ * phase bit.  Sets interrupt_ready so the worker loop will signal the MSI-X
+ * vector on the next pass.
+ */
 static void __fill_cq_result(struct nvmev_io_work *w)
 {
 	int sqid = w->sqid;
@@ -565,6 +628,22 @@ static void __fill_cq_result(struct nvmev_io_work *w)
 	spin_unlock(&cq->entry_lock);
 }
 
+/**
+ * nvmev_io_worker - IO worker thread: data copy + CQE posting
+ *
+ * Each worker owns a sorted list of pending nvmev_io_work entries.  On every
+ * iteration it:
+ *   1. Walks the list from head (earliest deadline) to tail.
+ *   2. For entries not yet copied: performs the host<->storage data copy
+ *      (__do_perform_io) or, for internal operations, skips the copy.
+ *   3. For entries whose nsecs_target has passed: posts the CQE (__fill_cq_result)
+ *      or releases the write buffer (internal operations), then marks is_completed.
+ *   4. After processing all pending entries, checks every assigned CQ for
+ *      pending interrupts and signals the MSI-X vector if needed.
+ *
+ * The clock delta (curr_nsecs_wall - curr_nsecs_local) compensates for skew
+ * between the dispatcher's cpu_clock and the worker's local_clock.
+ */
 static int nvmev_io_worker(void *data)
 {
 	struct nvmev_io_worker *worker = (struct nvmev_io_worker *)data;

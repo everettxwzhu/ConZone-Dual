@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/**
+ * ssd_config.h - compile-time SSD model and namespace configuration
+ *
+ * Select the target SSD model by defining BASE_SSD in the Makefile.
+ * Each model section defines the physical NAND geometry, latency values,
+ * write-buffer sizes, and namespace layout used by the FTL and channel model.
+ *
+ * Models:
+ *   INTEL_OPTANE    - byte-addressable NVM (no FTL, simple mapping)
+ *   SAMSUNG_970PRO  - conventional MLC NAND SSD (conv_ftl)
+ *   ZNS_PROTOTYPE   - TLC ZNS SSD prototype (zns_ftl)
+ *   KV_PROTOTYPE    - Key-Value SSD prototype (kv_ftl)
+ *   WD_ZN540        - WD ZN540 TLC ZNS SSD (zns_ftl)
+ *   CONZONE_PROTOTYPE - ConZone dual-namespace device with pSLC write buffer (zms_ftl)
+ */
+
 #ifndef _NVMEVIRT_SSD_CONFIG_H
 #define _NVMEVIRT_SSD_CONFIG_H
 
-/* SSD Model */
+/* ---- SSD model selector (set BASE_SSD in Makefile) ---- */
 #define INTEL_OPTANE 0
 #define SAMSUNG_970PRO 1
 #define ZNS_PROTOTYPE 2
@@ -11,22 +27,22 @@
 #define WD_ZN540 4
 #define CONZONE_PROTOTYPE 5
 
-/* SSD Type */
-#define SSD_TYPE_NVM 0
-#define SSD_TYPE_CONV 1
-#define SSD_TYPE_ZNS 2
-#define SSD_TYPE_KV 3
-#define SSD_TYPE_CONZONE_ZONED 4
-#define SSD_TYPE_CONZONE_META 5
-#define SSD_TYPE_CONZONE_BLOCK 6
-#define SSD_TYPE_NONE 7
+/* ---- Namespace command-set type codes ---- */
+#define SSD_TYPE_NVM 0            /* NVM command set (conventional block I/O) */
+#define SSD_TYPE_CONV 1           /* Conventional SSD with FTL */
+#define SSD_TYPE_ZNS 2            /* Zoned Namespace SSD */
+#define SSD_TYPE_KV 3             /* Key-Value SSD */
+#define SSD_TYPE_CONZONE_ZONED 4  /* ConZone zoned data namespace */
+#define SSD_TYPE_CONZONE_META 5   /* ConZone block metadata namespace (maps to pSLC area) */
+#define SSD_TYPE_CONZONE_BLOCK 6  /* ConZone block data namespace */
+#define SSD_TYPE_NONE 7           /* placeholder / disabled namespace */
 
-/* Cell Mode */
+/* ---- NAND cell mode (bits-per-cell) ---- */
 #define CELL_MODE_UNKNOWN 0
-#define CELL_MODE_SLC 1
-#define CELL_MODE_MLC 2
-#define CELL_MODE_TLC 3
-#define CELL_MODE_QLC 4
+#define CELL_MODE_SLC 1  /* Single-Level Cell: 1 bit/cell, fastest, lowest density */
+#define CELL_MODE_MLC 2  /* Multi-Level Cell: 2 bits/cell */
+#define CELL_MODE_TLC 3  /* Triple-Level Cell: 3 bits/cell */
+#define CELL_MODE_QLC 4  /* Quad-Level Cell: 4 bits/cell, slowest, highest density */
 #define MAX_CELL_MODE 5
 
 /* Must select one of INTEL_OPTANE, SAMSUNG_970PRO, or ZNS_PROTOTYPE
@@ -256,6 +272,29 @@ static_assert((ZONE_SIZE % DIES_PER_ZONE) == 0);
 #define LBA_BITS (9)
 #define LBA_SIZE (1 << LBA_BITS)
 
+/**
+ * CONZONE_PROTOTYPE - dual-namespace TLC/pSLC hybrid storage device
+ *
+ * Physical layout:
+ *   The device contains a single shared NAND array.  The first PHYSICAL_META_SIZE
+ *   bytes are reserved for the metadata (block) namespace (NS0), and the rest
+ *   for the zoned data namespace (NS1).
+ *
+ *   Within the NAND array the first pSLC_INIT_BLKS superblocks per plane are
+ *   operated in pseudo-SLC mode (one bit per cell, 1/CELL_MODE the capacity but
+ *   CELL_MODE times the speed).  These pSLC blocks serve as a write buffer for
+ *   both the metadata namespace and the zoned namespace.
+ *
+ * L2P mapping hierarchy (MAP_GRAN defines the granularity tried in order):
+ *   ZONE_MAP    -> SUB_ZONE_MAP (pSLC zone) -> CHUNK_MAP (4 MiB) -> PAGE_MAP (4 KiB)
+ *   A coarse entry is used when all pages in the range share the same PPA offset,
+ *   reducing the L2P cache working set.
+ *
+ * Write path (zoned namespace):
+ *   Host writes land in the pSLC write buffer.  When the buffer fills it is
+ *   flushed to the TLC area via an internal migration I/O.  GC reclaims TLC
+ *   blocks with the most invalid pages (lowest vpc) via a priority queue.
+ */
 // HN8T274EJKX130 Zoned UFS
 #elif (BASE_SSD == CONZONE_PROTOTYPE)
 #define NR_NAMESPACES (2ULL)

@@ -349,6 +349,26 @@ bool zms_block_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 	return true;
 }
 
+/**
+ * zms_init_params - set per-namespace parameters for the ConZone FTL
+ * @zpp: output znsparams to populate
+ * @physical_size: bytes allocated to this namespace from the storage region
+ * @ns: back-pointer to the nvmev_ns (stored in zpp->ns for later use)
+ * @ns_type: SSD_TYPE_CONZONE_META / _BLOCK / _ZONED
+ *
+ * The three namespace types share the physical NAND array but differ in their
+ * logical capacity, write-buffer configuration, and pSLC block allocation:
+ *
+ *   META  - block-interface namespace storing file-system metadata.
+ *           Logical size = LOGICAL_META_SIZE. All initial blocks are pSLC.
+ *
+ *   BLOCK - block-interface data namespace.
+ *           Logical size accounts for OP area and pSLC reserved space.
+ *
+ *   ZONED - zoned-interface data namespace.
+ *           Adds zone geometry (zone_size, nr_zones, active/open limits).
+ *           pSLC area serves as the write buffer flushed to TLC on migration.
+ */
 static void zms_init_params(struct znsparams *zpp, uint64_t physical_size, struct nvmev_ns *ns,
 							int ns_type)
 {
@@ -775,6 +795,19 @@ static void __init_rmap(struct zms_ftl *zms_ftl)
 
 static void __remove_rmap(struct zms_ftl *zms_ftl) { vfree(zms_ftl->rmap); }
 
+/**
+ * zms_realize_ftl - complete FTL initialization after the shared SSD is created
+ *
+ * Called by zms_realize_namespaces() once the single ssd instance is ready.
+ * Performs the second-phase initialization that requires the SSD geometry:
+ *   - L2P and reverse-map table allocation
+ *   - Line management (free/full/victim lists for normal and pSLC lines)
+ *   - Write-flow-control credit initialization
+ *   - GC and migration aggregation buffer allocation
+ *   - Per-zone aggregation buffers for pSLC->TLC migration
+ *   - Priority queue for migration ordering (by write order)
+ *   - Read aggregation workspace arrays
+ */
 static void zms_realize_ftl(struct zms_ftl *zms_ftl)
 {
 	int i, j;
@@ -971,6 +1004,21 @@ void zms_remove_ssd(struct nvmev_ns *ns)
 	kfree(zms_ftl->ssd);
 }
 
+/**
+ * zms_realize_namespaces - create the shared SSD and wire it to all namespaces
+ * @ns: array of all configured namespaces
+ * @nr_ns: number of namespaces
+ * @size: total physical storage size (passed to ssd_init_params)
+ * @cpu_nr_dispatcher: CPU affinity for the SSD's performance model clock
+ *
+ * For CONZONE_PROTOTYPE all namespaces share a single ssd instance because
+ * they map to the same physical NAND array.  This function:
+ *   1. Allocates and initializes the shared ssd (geometry + channel model).
+ *   2. Assigns ssd to each zms_ftl->ssd pointer.
+ *   3. Calls zms_realize_ftl() for each namespace to finish L2P/line init.
+ *
+ * Must be called after all zms_init_namespace() calls have finished.
+ */
 void zms_realize_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t size,
 							uint32_t cpu_nr_dispatcher)
 {
