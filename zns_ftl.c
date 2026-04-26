@@ -116,10 +116,12 @@ static void __init_resource(struct zns_ftl *zns_ftl)
 }
 
 static void zns_init_params(struct znsparams *zpp, struct ssdparams *spp, uint64_t capacity,
-							struct nvmev_ns *ns, int ns_type)
+							struct nvmev_ns *ns, uint32_t nsid, int ns_type)
 {
 	*zpp = (struct znsparams){
+		.ns = ns,
 		.ns_type = ns_type,
+		.cell_mode = NS_CELL_MODE(nsid),
 		.physical_size = capacity,
 		.logical_size = capacity,
 		.zone_size = ZONE_SIZE,
@@ -134,11 +136,46 @@ static void zns_init_params(struct znsparams *zpp, struct ssdparams *spp, uint64
 		.zrwa_buffer_size = ZRWA_BUFFER_SIZE,
 		.lbas_per_zrwa = ZRWA_SIZE / spp->secsz,
 		.lbas_per_zrwafg = ZRWAFG_SIZE / spp->secsz,
+		.zone_capacity = ZONE_SIZE,
+		.pgs_per_zone = ZONE_SIZE / spp->pgsz,
+		.blk_start = 0,
+		.blks_per_pl = spp->blks_per_pl,
+		.pgs_per_prog_unit = spp->pgs_per_oneshotpg,
+		.pgs_per_read_unit = spp->pgs_per_flashpg,
+		.pgs_per_blk = spp->pgs_per_blk,
 	};
 
 #if (BASE_SSD == ZNS_PROTOTYPE)
 	zpp->zone_capacity = ZONE_CAPACITY;
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	if (zpp->cell_mode == CELL_MODE_SLC) {
+		zpp->zone_capacity = DUAL_SLC_BLK_SIZE * DIES_PER_ZONE;
+		zpp->zone_size = roundup_pow_of_two(zpp->zone_capacity);
+		zpp->nr_zones = capacity / zpp->zone_size;
+		zpp->nr_active_zones = zpp->nr_zones;
+		zpp->nr_open_zones = zpp->nr_zones;
+		zpp->blk_start = 0;
+		zpp->blks_per_pl = spp->slc_blks_per_pl;
+		zpp->pgs_per_prog_unit = spp->slc_pgs_per_oneshotpg;
+		zpp->pgs_per_read_unit = spp->pgs_per_flashpg;
+		zpp->pgs_per_blk = spp->slc_pgs_per_blk;
+	} else {
+		zpp->zone_capacity = BLK_SIZE * DIES_PER_ZONE;
+		zpp->zone_size = roundup_pow_of_two(zpp->zone_capacity);
+		zpp->nr_zones = capacity / zpp->zone_size;
+		zpp->nr_active_zones = zpp->nr_zones;
+		zpp->nr_open_zones = zpp->nr_zones;
+		zpp->blk_start = spp->slc_blks_per_pl;
+		zpp->blks_per_pl = spp->tlc_blks_per_pl;
+		zpp->pgs_per_prog_unit = spp->pgs_per_oneshotpg;
+		zpp->pgs_per_read_unit = spp->pgs_per_flashpg;
+		zpp->pgs_per_blk = spp->pgs_per_blk;
+	}
+
+	zpp->physical_size = (uint64_t)zpp->nr_zones * zpp->zone_capacity;
 #endif
+	zpp->pgs_per_zone = zpp->zone_capacity / spp->pgsz;
+
 	if (zpp->logical_size % zpp->zone_size != 0) {
 		NVMEV_INFO("Invalid logical size (%llu MiB) zone size (%llu MiB) nr zones %d\n",
 				   BYTE_TO_MB(zpp->logical_size), BYTE_TO_MB(zpp->zone_size), zpp->nr_zones);
@@ -151,18 +188,27 @@ static void zns_init_params(struct znsparams *zpp, struct ssdparams *spp, uint64
 					BYTE_TO_KB(spp->pgsz));
 	}
 
-	NVMEV_INFO("zone_size=%llu(Byte),%llu(MB), # zones=%d # die/zone=%d \n", zpp->zone_size,
-			   BYTE_TO_MB(zpp->zone_size), zpp->nr_zones, zpp->dies_per_zone);
+	if (!zpp->blks_per_pl)
+		zpp->blks_per_pl = DIV_ROUND_UP((uint64_t)zpp->nr_zones * zpp->dies_per_zone,
+										spp->tt_luns);
+
+	NVMEV_ASSERT(zpp->blks_per_pl <= spp->blks_per_pl - zpp->blk_start);
+	NVMEV_INFO("zone_size=%llu(Byte),%llu(MB), zone_capacity=%u(MB), # zones=%d # die/zone=%d "
+			   "cell=%d blk_range=[%u,%u)\n",
+			   zpp->zone_size, BYTE_TO_MB(zpp->zone_size), BYTE_TO_MB(zpp->zone_capacity),
+			   zpp->nr_zones, zpp->dies_per_zone, zpp->cell_mode, zpp->blk_start,
+			   zpp->blk_start + zpp->blks_per_pl);
 }
 
 static void zns_init_ftl(struct zns_ftl *zns_ftl, struct znsparams *zpp, struct ssd *ssd,
-						 void *mapped_addr)
+						 void *mapped_addr, bool owns_ssd)
 {
 	*zns_ftl = (struct zns_ftl){
 		.zp = *zpp, /*copy znsparams*/
 
 		.ssd = ssd,
 		.storage_base_addr = mapped_addr,
+		.owns_ssd = owns_ssd,
 	};
 
 	__init_descriptor(zns_ftl);
@@ -186,8 +232,8 @@ void zns_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *m
 	ssd_init(ssd, &spp, cpu_nr_dispatcher);
 
 	zns_ftl = kmalloc(sizeof(struct zns_ftl) * nr_parts, GFP_KERNEL);
-	zns_init_params(&zpp, &spp, size, ns, NS_SSD_TYPE(id));
-	zns_init_ftl(zns_ftl, &zpp, ssd, mapped_addr);
+	zns_init_params(&zpp, &spp, size, ns, id, NS_SSD_TYPE(id));
+	zns_init_ftl(zns_ftl, &zpp, ssd, mapped_addr, true);
 
 	*ns = (struct nvmev_ns){
 		.id = id,
@@ -203,14 +249,62 @@ void zns_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *m
 	return;
 }
 
+#if (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+void zns_init_dual_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t storage_size,
+							  void *mapped_addr, uint32_t cpu_nr_dispatcher)
+{
+	struct ssd *ssd;
+	struct ssdparams spp;
+	void *ns_addr = mapped_addr;
+	uint64_t required_size = DUAL_SLC_SIZE + DUAL_TLC_SIZE;
+	const uint32_t nr_parts = 1;
+	int i;
+
+	NVMEV_ASSERT(nr_ns == NR_NAMESPACES);
+	NVMEV_ASSERT(storage_size >= required_size);
+
+	ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
+	memset(&spp, 0, sizeof(struct ssdparams));
+	ssd_init_params(&spp, required_size, nr_parts);
+	ssd_init(ssd, &spp, cpu_nr_dispatcher);
+
+	for (i = 0; i < nr_ns; i++) {
+		struct zns_ftl *zns_ftl;
+		struct znsparams zpp;
+		uint64_t size = NS_CAPACITY(i);
+
+		zns_ftl = kmalloc(sizeof(struct zns_ftl), GFP_KERNEL);
+		zns_init_params(&zpp, &spp, size, &ns[i], i, NS_SSD_TYPE(i));
+		zns_init_ftl(zns_ftl, &zpp, ssd, ns_addr, i == 0);
+
+		ns[i] = (struct nvmev_ns){
+			.id = i,
+			.csi = NVME_CSI_ZNS,
+			.nr_parts = nr_parts,
+			.ftls = (void *)zns_ftl,
+			.size = zpp.logical_size,
+			.mapped = ns_addr,
+			.proc_io_cmd = zns_proc_nvme_io_cmd,
+		};
+
+		ns_addr += zpp.logical_size;
+		NVMEV_INFO("dual ns %d/%d: %s size %llu MiB ftl %p shared ssd %p\n", i, nr_ns,
+				   zpp.cell_mode == CELL_MODE_SLC ? "SLC" : "TLC", BYTE_TO_MB(ns[i].size),
+				   zns_ftl, ssd);
+	}
+}
+#endif
+
 void zns_remove_namespace(struct nvmev_ns *ns)
 {
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
 
-	ssd_remove(zns_ftl->ssd);
+	if (zns_ftl->owns_ssd) {
+		ssd_remove(zns_ftl->ssd);
+		kfree(zns_ftl->ssd);
+	}
 
 	__remove_descriptor(zns_ftl);
-	kfree(zns_ftl->ssd);
 	kfree(zns_ftl);
 
 	ns->ftls = NULL;

@@ -9,6 +9,7 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 {
 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
 	struct ssdparams *spp = &zns_ftl->ssd->sp;
+	struct znsparams *zpp = &zns_ftl->zp;
 	struct nvme_rw_command *cmd = &(req->cmd->rw);
 
 	uint64_t slba = cmd->slba;
@@ -122,21 +123,22 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 		uint64_t pg_off;
 
 		ppa = __lpn_to_ppa(zns_ftl, lpn);
-		pg_off = ppa.g.pg % spp->pgs_per_oneshotpg;
-		pgs = min(elpn - lpn + 1, (uint64_t)(spp->pgs_per_oneshotpg - pg_off));
+		pg_off = ppa.g.pg % zpp->pgs_per_prog_unit;
+		pgs = min(elpn - lpn + 1, (uint64_t)(zpp->pgs_per_prog_unit - pg_off));
 
 		/* Aggregate write io in flash page */
-		if (((pg_off + pgs) == spp->pgs_per_oneshotpg) || ((lpn + pgs - 1) == zone_elpn)) {
+		if (((pg_off + pgs) == zpp->pgs_per_prog_unit) || ((lpn + pgs - 1) == zone_elpn)) {
 			struct nand_cmd swr = {
 				.type = USER_IO,
 				.cmd = NAND_WRITE,
 				.stime = nsecs_xfer_completed,
-				.xfer_size = spp->pgs_per_oneshotpg * spp->pgsz,
+				.xfer_size = zpp->pgs_per_prog_unit * spp->pgsz,
 				.interleave_pci_dma = false,
 				.ppa = ppa,
 			};
 			size_t bufs_to_release;
-			uint32_t unaligned_space = zns_ftl->zp.zone_size % (spp->pgs_per_oneshotpg * spp->pgsz);
+			uint32_t unaligned_space =
+				zns_ftl->zp.zone_size % (zpp->pgs_per_prog_unit * spp->pgsz);
 			uint64_t nsecs_completed = ssd_advance_nand(zns_ftl->ssd, &swr);
 
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
@@ -146,7 +148,7 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 			if (((lpn + pgs - 1) == zone_elpn) && (unaligned_space > 0))
 				bufs_to_release = unaligned_space;
 			else
-				bufs_to_release = spp->pgs_per_oneshotpg * spp->pgsz;
+				bufs_to_release = zpp->pgs_per_prog_unit * spp->pgsz;
 
 			schedule_internal_operation(req->sq_id, nsecs_completed, write_buffer, bufs_to_release);
 		}
@@ -285,14 +287,14 @@ static bool __zns_write_zrwa(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	/* Aggregate write io in flash page */
 	while (remaining > 0) {
 		ppa = __lpn_to_ppa(zns_ftl, lpn);
-		pg_off = ppa.g.pg % spp->pgs_per_oneshotpg;
-		pgs = min(remaining, (uint64_t)(spp->pgs_per_oneshotpg - pg_off));
+		pg_off = ppa.g.pg % zpp->pgs_per_prog_unit;
+		pgs = min(remaining, (uint64_t)(zpp->pgs_per_prog_unit - pg_off));
 
-		if ((pg_off + pgs) == spp->pgs_per_oneshotpg) {
+		if ((pg_off + pgs) == zpp->pgs_per_prog_unit) {
 			swr.type = USER_IO;
 			swr.cmd = NAND_WRITE;
 			swr.stime = nsecs_xfer_completed;
-			swr.xfer_size = spp->pgs_per_oneshotpg * spp->pgsz;
+			swr.xfer_size = zpp->pgs_per_prog_unit * spp->pgsz;
 			swr.interleave_pci_dma = false;
 			swr.ppa = ppa;
 
@@ -300,7 +302,7 @@ static bool __zns_write_zrwa(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 			schedule_internal_operation(req->sq_id, nsecs_completed, &zns_ftl->zrwa_buffer[zid],
-										spp->pgs_per_oneshotpg * spp->pgsz);
+										zpp->pgs_per_prog_unit * spp->pgsz);
 		}
 
 		lpn += pgs;
@@ -341,6 +343,7 @@ bool zns_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_resul
 {
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
 	struct ssdparams *spp = &zns_ftl->ssd->sp;
+	struct znsparams *zpp = &zns_ftl->zp;
 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
 	struct nvme_rw_command *cmd = &(req->cmd->rw);
 
@@ -385,8 +388,8 @@ bool zns_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_resul
 
 	for (lpn = slpn; lpn <= elpn; lpn += pgs) {
 		ppa = __lpn_to_ppa(zns_ftl, lpn);
-		pg_off = ppa.g.pg % spp->pgs_per_flashpg;
-		pgs = min(elpn - lpn + 1, (uint64_t)(spp->pgs_per_flashpg - pg_off));
+		pg_off = ppa.g.pg % zpp->pgs_per_read_unit;
+		pgs = min(elpn - lpn + 1, (uint64_t)(zpp->pgs_per_read_unit - pg_off));
 		swr.xfer_size = pgs * spp->pgsz;
 		swr.ppa = ppa;
 		nsecs_completed = ssd_advance_nand(zns_ftl->ssd, &swr);

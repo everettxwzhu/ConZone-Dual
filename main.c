@@ -522,6 +522,9 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 
 	struct nvmev_ns *ns = kmalloc(sizeof(struct nvmev_ns) * nr_ns, GFP_KERNEL);
 
+#if (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	zns_init_dual_namespaces(ns, nr_ns, nvmev_vdev->config.storage_size, ns_addr, disp_no);
+#else
 	for (i = 0; i < nr_ns; i++) {
 		if (NS_CAPACITY(i) == 0)
 			size = remaining_capacity;
@@ -549,6 +552,7 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 		ns_addr += size;
 		NVMEV_INFO("ns %d/%d: size %lld MiB\n", i, nr_ns, BYTE_TO_MB(ns[i].size));
 	}
+#endif
 
 #if (BASE_SSD == CONZONE_PROTOTYPE)
 	zms_realize_namespaces(ns, nr_ns, nvmev_vdev->config.storage_size, disp_no);

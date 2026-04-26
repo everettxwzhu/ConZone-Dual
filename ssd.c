@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/ktime.h>
+#include <linux/log2.h>
 #include <linux/sched/clock.h>
 
 #include "nvmev.h"
@@ -172,6 +173,21 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->pslc_blks = pSLC_INIT_BLKS;
 	spp->meta_pslc_blks = META_pSLC_INIT_BLKS;
 	spp->meta_normal_blks = 0; // FIX: should be zero
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	{
+		uint64_t slc_zone_capacity = DUAL_SLC_BLK_SIZE * DIES_PER_ZONE;
+		uint64_t tlc_zone_capacity = BLK_SIZE * DIES_PER_ZONE;
+		uint64_t slc_zone_size = roundup_pow_of_two(slc_zone_capacity);
+		uint64_t tlc_zone_size = roundup_pow_of_two(tlc_zone_capacity);
+		uint64_t slc_nr_zones = DUAL_SLC_SIZE / slc_zone_size;
+		uint64_t tlc_nr_zones = DUAL_TLC_SIZE / tlc_zone_size;
+		uint64_t tt_luns = spp->nchs * spp->luns_per_ch;
+
+		spp->slc_pgs_per_oneshotpg = FLASH_PAGE_SIZE / spp->pgsz;
+		spp->slc_pgs_per_blk = DUAL_SLC_BLK_SIZE / spp->pgsz;
+		spp->slc_blks_per_pl = DIV_ROUND_UP(slc_nr_zones * DIES_PER_ZONE, tt_luns);
+		spp->tlc_blks_per_pl = DIV_ROUND_UP(tlc_nr_zones * DIES_PER_ZONE, tt_luns);
+	}
 #endif
 
 	if (BLKS_PER_PLN > 0) {
@@ -192,6 +208,10 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 			DIV_ROUND_UP(capacity, (blk_size * spp->pls_per_lun * spp->luns_per_ch * spp->nchs));
 		// SSD can't be too small.
 		NVMEV_ASSERT(spp->blks_per_pl >= 4);
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+		spp->blks_per_pl = spp->slc_blks_per_pl + spp->tlc_blks_per_pl;
+		NVMEV_ASSERT(spp->slc_blks_per_pl > 0);
+		NVMEV_ASSERT(spp->tlc_blks_per_pl > 0);
 #else
 		spp->blks_per_pl =
 			DIV_ROUND_UP(capacity, (blk_size * spp->pls_per_lun * spp->luns_per_ch * spp->nchs));
@@ -261,6 +281,29 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->pg_wr_lat[CELL_MODE_MLC] = MLC_NAND_PROG_LATENCY;
 	spp->pg_wr_lat[CELL_MODE_TLC] = TLC_NAND_PROG_LATENCY;
 	spp->pg_wr_lat[CELL_MODE_QLC] = QLC_NAND_PROG_LATENCY;
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	spp->pg_4kb_rd_lat[CELL_MODE_SLC][CELL_TYPE_LSB] = SLC_NAND_READ_LATENCY_LSB;
+	spp->pg_4kb_rd_lat[CELL_MODE_SLC][CELL_TYPE_MSB] = 0;
+	spp->pg_4kb_rd_lat[CELL_MODE_SLC][CELL_TYPE_CSB] = 0;
+	spp->pg_4kb_rd_lat[CELL_MODE_SLC][CELL_TYPE_TSB] = 0;
+
+	spp->pg_4kb_rd_lat[CELL_MODE_TLC][CELL_TYPE_LSB] = TLC_NAND_READ_LATENCY_LSB;
+	spp->pg_4kb_rd_lat[CELL_MODE_TLC][CELL_TYPE_MSB] = TLC_NAND_READ_LATENCY_MSB;
+	spp->pg_4kb_rd_lat[CELL_MODE_TLC][CELL_TYPE_CSB] = TLC_NAND_READ_LATENCY_CSB;
+	spp->pg_4kb_rd_lat[CELL_MODE_TLC][CELL_TYPE_TSB] = 0;
+
+	spp->pg_rd_lat[CELL_MODE_SLC][CELL_TYPE_LSB] = SLC_NAND_READ_LATENCY_LSB;
+	spp->pg_rd_lat[CELL_MODE_SLC][CELL_TYPE_MSB] = 0;
+	spp->pg_rd_lat[CELL_MODE_SLC][CELL_TYPE_CSB] = 0;
+	spp->pg_rd_lat[CELL_MODE_SLC][CELL_TYPE_TSB] = 0;
+
+	spp->pg_rd_lat[CELL_MODE_TLC][CELL_TYPE_LSB] = TLC_NAND_READ_LATENCY_LSB;
+	spp->pg_rd_lat[CELL_MODE_TLC][CELL_TYPE_MSB] = TLC_NAND_READ_LATENCY_MSB;
+	spp->pg_rd_lat[CELL_MODE_TLC][CELL_TYPE_CSB] = TLC_NAND_READ_LATENCY_CSB;
+	spp->pg_rd_lat[CELL_MODE_TLC][CELL_TYPE_TSB] = 0;
+
+	spp->pg_wr_lat[CELL_MODE_SLC] = SLC_NAND_PROG_LATENCY;
+	spp->pg_wr_lat[CELL_MODE_TLC] = TLC_NAND_PROG_LATENCY;
 #else
 	spp->pg_4kb_rd_lat[spp->cell_mode][CELL_TYPE_LSB] = NAND_4KB_READ_LATENCY_LSB;
 	spp->pg_4kb_rd_lat[spp->cell_mode][CELL_TYPE_MSB] = NAND_4KB_READ_LATENCY_MSB;
@@ -354,6 +397,11 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 			   spp->pslc_pgs_per_blk, spp->pslc_pgs_per_line);
 	NVMEV_INFO("[pSLC Pages per Oneshotpg] %lld [pSLC Pages per Line] %lld \n", spp->pslc_pgs_per_oneshotpg, spp->pslc_pgs_per_line);
 	NVMEV_INFO("[Logical Pages per Line] %ld\n", spp->pgs_per_line);
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	NVMEV_INFO("[DUAL SLC Blocks per Plane] %llu [TLC Blocks per Plane] %llu\n",
+			   spp->slc_blks_per_pl, spp->tlc_blks_per_pl);
+	NVMEV_INFO("[SLC Logical Pages per Block] %llu [SLC Pages per Oneshotpg] %llu\n",
+			   spp->slc_pgs_per_blk, spp->slc_pgs_per_oneshotpg);
 #endif
 
 	check_params(spp);
@@ -421,6 +469,14 @@ static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
 			pl->blk[i].used_pgs = spp->pslc_pgs_per_blk;
 		} else {
 			pl->blk[i].nand_type = CELL_MODE;
+			pl->blk[i].used_pgs = spp->pgs_per_blk;
+		}
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+		if (i < spp->slc_blks_per_pl) {
+			pl->blk[i].nand_type = CELL_MODE_SLC;
+			pl->blk[i].used_pgs = spp->slc_pgs_per_blk;
+		} else {
+			pl->blk[i].nand_type = CELL_MODE_TLC;
 			pl->blk[i].used_pgs = spp->pgs_per_blk;
 		}
 #else

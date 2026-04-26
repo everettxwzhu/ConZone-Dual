@@ -282,6 +282,11 @@ struct ssdparams {
 	uint64_t pslc_blks;
 	uint64_t meta_pslc_blks;
 	uint64_t meta_normal_blks;
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+	uint64_t slc_blks_per_pl;
+	uint64_t tlc_blks_per_pl;
+	uint64_t slc_pgs_per_blk;
+	uint64_t slc_pgs_per_oneshotpg;
 #endif
 };
 

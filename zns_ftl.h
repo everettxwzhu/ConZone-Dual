@@ -78,6 +78,12 @@ struct znsparams {
 	uint32_t chunk_size;	// bytes
 	uint32_t pgs_per_chunk;
 	uint32_t pgs_per_zone;
+	int cell_mode;
+	uint32_t blk_start;
+	uint32_t blks_per_pl;
+	uint32_t pgs_per_prog_unit;
+	uint32_t pgs_per_read_unit;
+	uint32_t pgs_per_blk;
 
 	int pba_pcent; // (physical space / logical space) * 100
 
@@ -110,6 +116,7 @@ struct zns_ftl {
 	struct buffer *zone_write_buffer;
 	struct buffer *zrwa_buffer;
 	void *storage_base_addr;
+	bool owns_ssd;
 };
 
 struct migrating_lineid {
@@ -411,9 +418,14 @@ static inline struct ppa __lpn_to_ppa(struct zns_ftl *zns_ftl, uint64_t lpn)
 	struct znsparams *zpp = &zns_ftl->zp;
 	uint64_t zone = lpn_to_zone(zns_ftl, lpn); // find corresponding zone
 	uint64_t off = lpn - zone_to_slpn(zns_ftl, zone);
+	uint64_t prog_idx = off / zpp->pgs_per_prog_unit;
+	uint64_t die_slot = prog_idx % zpp->dies_per_zone;
+	uint64_t blk_off = ((zone * zpp->dies_per_zone) + die_slot) / spp->tt_luns;
+	uint32_t pg = ((prog_idx / zpp->dies_per_zone) * zpp->pgs_per_prog_unit) +
+				  (off % zpp->pgs_per_prog_unit);
 
 	uint32_t sdie = (zone * zpp->dies_per_zone) % spp->tt_luns;
-	uint32_t die = sdie + ((off / spp->pgs_per_oneshotpg) % zpp->dies_per_zone);
+	uint32_t die = (sdie + die_slot) % spp->tt_luns;
 
 	uint32_t channel = die_to_channel(zns_ftl, die);
 	uint32_t lun = die_to_lun(zns_ftl, die);
@@ -422,9 +434,13 @@ static inline struct ppa __lpn_to_ppa(struct zns_ftl *zns_ftl, uint64_t lpn)
 			{
 				.lun = lun,
 				.ch = channel,
-				.pg = off % spp->pgs_per_oneshotpg,
+				.blk = zpp->blk_start + blk_off,
+				.pg = pg,
 			},
 	};
+
+	NVMEV_ASSERT(blk_off < zpp->blks_per_pl);
+	NVMEV_ASSERT(pg < zpp->pgs_per_blk);
 
 	return ppa;
 }
@@ -433,6 +449,10 @@ static inline struct ppa __lpn_to_ppa(struct zns_ftl *zns_ftl, uint64_t lpn)
 void zns_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
 						uint32_t cpu_nr_dispatcher);
 void zns_remove_namespace(struct nvmev_ns *ns);
+#if (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+void zns_init_dual_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t storage_size,
+							  void *mapped_addr, uint32_t cpu_nr_dispatcher);
+#endif
 
 void zns_zmgmt_recv(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
 void zns_zmgmt_send(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);

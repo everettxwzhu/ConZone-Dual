@@ -10,6 +10,7 @@
 #define KV_PROTOTYPE 3
 #define WD_ZN540 4
 #define CONZONE_PROTOTYPE 5
+#define DUAL_ZNS_PROTOTYPE 6
 
 /* SSD Type */
 #define SSD_TYPE_NVM 0
@@ -179,6 +180,76 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define BLKS_PER_PLN 0 /* BLK_SIZE should not be 0 */
 #define BLK_SIZE (ZONE_CAPACITY / DIES_PER_ZONE)
 static_assert((ZONE_CAPACITY % DIES_PER_ZONE) == 0);
+
+/* For ZRWA */
+#define MAX_ZRWA_ZONES (0)
+#define ZRWAFG_SIZE (0)
+#define ZRWA_SIZE (0)
+#define ZRWA_BUFFER_SIZE (0)
+
+#define LBA_BITS (9)
+#define LBA_SIZE (1 << LBA_BITS)
+
+#elif (BASE_SSD == DUAL_ZNS_PROTOTYPE)
+#define NR_NAMESPACES (2ULL)
+
+#define DUAL_SLC_SIZE GB(2ULL)
+#define DUAL_TLC_SIZE GB(8ULL)
+
+#define NS_SSD_TYPE_0 SSD_TYPE_ZNS
+#define NS_CAPACITY_0 (DUAL_SLC_SIZE)
+#define NS_CELL_MODE_0 (CELL_MODE_SLC)
+#define NS_SSD_TYPE_1 SSD_TYPE_ZNS
+#define NS_CAPACITY_1 (DUAL_TLC_SIZE)
+#define NS_CELL_MODE_1 (CELL_MODE_TLC)
+#define MDTS (6)
+#define CELL_MODE (CELL_MODE_TLC)
+
+#define SSD_PARTITIONS (1)
+#define NAND_CHANNELS (4)
+#define LUNS_PER_NAND_CH (2)
+#define PLNS_PER_LUN (1)
+#define DIES_PER_ZONE (4)
+
+#define FLASH_PAGE_SIZE KB(32)
+#define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * CELL_MODE)
+static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
+
+#define BLKS_PER_PLN 0 /* BLK_SIZE should not be 0 */
+#define BLK_SIZE MB(96ULL)
+#define ZONE_CAPACITY (BLK_SIZE * DIES_PER_ZONE)
+#define ZONE_SIZE MB(512ULL)
+#define DUAL_SLC_BLK_SIZE (BLK_SIZE / CELL_MODE)
+static_assert((BLK_SIZE % CELL_MODE) == 0);
+static_assert((BLK_SIZE % ONESHOT_PAGE_SIZE) == 0);
+static_assert(((DUAL_SLC_BLK_SIZE * PLNS_PER_LUN) % FLASH_PAGE_SIZE) == 0);
+
+#define MAX_CH_XFER_SIZE (FLASH_PAGE_SIZE)
+#define WRITE_UNIT_SIZE (512)
+
+#define NAND_CHANNEL_BANDWIDTH (1422ull)
+#define PCIE_BANDWIDTH (3000ull)
+
+#define SLC_NAND_PROG_LATENCY (75000)
+#define TLC_NAND_PROG_LATENCY (937500)
+
+#define SLC_NAND_READ_LATENCY_LSB (20000)
+#define TLC_NAND_READ_LATENCY_LSB (40000)
+#define TLC_NAND_READ_LATENCY_MSB (40000)
+#define TLC_NAND_READ_LATENCY_CSB (40000)
+
+#define NAND_ERASE_LATENCY (3500000)
+
+#define FW_4KB_READ_LATENCY (20000)
+#define FW_READ_LATENCY (13000)
+#define FW_WBUF_LATENCY0 (5600)
+#define FW_WBUF_LATENCY1 (600)
+#define FW_CH_XFER_LATENCY (0)
+#define OP_AREA_PERCENT (0)
+
+#define GLOBAL_WB_SIZE KB(512)
+#define ZONE_WB_SIZE KB(512)
+#define WRITE_EARLY_COMPLETION 1
 
 /* For ZRWA */
 #define MAX_ZRWA_ZONES (0)
@@ -430,11 +501,21 @@ static_assert(((pSLC_BLK_SIZE * PLNS_PER_LUN) % pSLC_ONESHOT_PAGE_SIZE) == 0);
 #endif
 ///////////////////////////////////////////////////////////////////////////
 
+#ifndef NS_CELL_MODE_0
+#define NS_CELL_MODE_0 CELL_MODE
+#endif
+
+#ifndef NS_CELL_MODE_1
+#define NS_CELL_MODE_1 CELL_MODE
+#endif
+
 static const uint32_t ns_ssd_type[] = {NS_SSD_TYPE_0, NS_SSD_TYPE_1};
 static const uint64_t ns_capacity[] = {NS_CAPACITY_0, NS_CAPACITY_1};
+static const uint32_t ns_cell_mode[] = {NS_CELL_MODE_0, NS_CELL_MODE_1};
 
 #define NS_SSD_TYPE(ns) (ns_ssd_type[ns])
 #define NS_CAPACITY(ns) (ns_capacity[ns])
+#define NS_CELL_MODE(ns) (ns_cell_mode[ns])
 
 /* Still only support NR_NAMESPACES <= 2 */
 static_assert(NR_NAMESPACES <= 2);
