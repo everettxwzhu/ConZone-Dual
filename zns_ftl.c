@@ -23,7 +23,7 @@ static void __init_buffer(struct zns_ftl *zns_ftl)
 
 	if (zone_wb_size) {
 		uint32_t wb_size = zone_wb_size;
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 		if (is_zoned(zns_ftl->zp.ns_type)) {
 			switch (WB_MGNT) {
 			case WB_STATIC:
@@ -54,7 +54,7 @@ static void __init_descriptor(struct zns_ftl *zns_ftl)
 	uint32_t i = 0;
 	__init_buffer(zns_ftl);
 
-	int ns_type = BASE_SSD == CONZONE_PROTOTYPE ? zns_ftl->zp.ns_type : SSD_TYPE_ZNS;
+	int ns_type = IS_CONZONE ? zns_ftl->zp.ns_type : SSD_TYPE_ZNS;
 	if (!is_zoned(ns_type) && ns_type != SSD_TYPE_ZNS)
 		return;
 
@@ -222,7 +222,7 @@ static void zns_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint32_t i;
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	// flush write buffer
 	struct zms_ftl *zms_ftl = (struct zms_ftl *)(&(*zns_ftl));
 
@@ -244,7 +244,7 @@ static void zns_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	ret->status = NVME_SC_SUCCESS;
 	ret->nsecs_target = latest;
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	zms_ftl->host_flush_cnt++;
 #endif
 	return;
@@ -285,7 +285,7 @@ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct
 	return true;
 }
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 bool zms_zoned_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 								struct nvmev_result *ret)
 {
@@ -361,6 +361,25 @@ static void zms_init_params(struct znsparams *zpp, uint64_t physical_size, struc
 		.enable_gc_delay = 1,
 		.nr_zrwa_zones = 0,
 	};
+	if (zms_is_dual_ns(ns_type)) {
+		uint32_t zone_program_unit = ns_type == SSD_TYPE_CONZONE_SLC ? pSLC_ONESHOT_PAGE_SIZE * PLNS_PER_ZONE : ONESHOT_PAGE_SIZE * PLNS_PER_ZONE;
+
+		zpp->logical_size = 0;
+		zpp->nr_wb = max_t(uint32_t, 1, ZONE_WB_SIZE / zone_program_unit);
+		zpp->zone_wb_size = ZONE_WB_SIZE;
+		zpp->pslc_blks = ns_type == SSD_TYPE_CONZONE_SLC ? DUAL_SLC_INIT_BLKS : 0;
+		zpp->nr_active_zones = 6;
+		zpp->nr_open_zones = 6;
+		zpp->dies_per_zone = DIES_PER_ZONE;
+		zpp->chunk_size = CHUNK_SIZE;
+		zpp->pgs_per_chunk = CHUNK_SIZE / PG_SIZE;
+		zpp->pre_read = L2P_PREREAD;
+		NVMEV_INFO("-------------DUAL PARAMS (%s)----------------\n",
+				   ns_type == SSD_TYPE_CONZONE_SLC ? "SLC" : "TLC");
+		NVMEV_INFO("[Write Buffer Size] %u KiB [# of Write Buffer] %u\n",
+				   BYTE_TO_KB(zpp->zone_wb_size), zpp->nr_wb);
+		return;
+	}
 	if (ns_type == SSD_TYPE_CONZONE_META) {
 		zpp->logical_size = LOGICAL_META_SIZE;
 		zpp->nr_wb = NR_META_WB;
@@ -444,6 +463,8 @@ static void zms_init_params(struct znsparams *zpp, uint64_t physical_size, struc
 
 static void zms_init_ftl(struct zms_ftl *zms_ftl, struct znsparams *zpp, void *mapped_addr)
 {
+	bool defer_zoned_init = zms_is_dual_ns(zpp->ns_type);
+
 	*zms_ftl = (struct zms_ftl){
 		.zp = *zpp, /*copy znsparams*/
 
@@ -452,8 +473,9 @@ static void zms_init_ftl(struct zms_ftl *zms_ftl, struct znsparams *zpp, void *m
 		.last_gc_ppa.ppa = UNMAPPED_PPA,
 	};
 
-	__init_descriptor((struct zns_ftl *)(&(*zms_ftl)));
-	if (is_zoned(zpp->ns_type)) {
+	if (!defer_zoned_init)
+		__init_descriptor((struct zns_ftl *)(&(*zms_ftl)));
+	if (is_zoned(zpp->ns_type) && !defer_zoned_init) {
 		__init_resource((struct zns_ftl *)(&(*zms_ftl)));
 	}
 }
@@ -775,6 +797,50 @@ static void __init_rmap(struct zms_ftl *zms_ftl)
 
 static void __remove_rmap(struct zms_ftl *zms_ftl) { vfree(zms_ftl->rmap); }
 
+static void zms_realize_dual_params(struct zms_ftl *zms_ftl)
+{
+	struct ssd *ssd = zms_ftl->ssd;
+	struct ssdparams *spp = &ssd->sp;
+	struct znsparams *zpp = &zms_ftl->zp;
+	int location = zms_dual_target_loc(zpp->ns_type);
+	uint64_t media_rows;
+	uint64_t media_pgs_per_line;
+	uint64_t media_bytes;
+	uint64_t zone_capacity;
+
+	if (location == LOC_PSLC) {
+		media_rows = spp->pslc_blks;
+		media_pgs_per_line = spp->pslc_pgs_per_line;
+	} else {
+		media_rows = spp->blks_per_pl > spp->pslc_blks ? spp->blks_per_pl - spp->pslc_blks : 0;
+		media_pgs_per_line = spp->pgs_per_line;
+	}
+
+	zpp->tt_lines = media_rows * spp->line_groups;
+	zpp->pslc_lines = location == LOC_PSLC ? zpp->tt_lines : 0;
+	zpp->pgs_per_line = media_pgs_per_line;
+	zpp->pslc_pgs_per_line = spp->pslc_pgs_per_line;
+
+	zone_capacity = media_pgs_per_line * spp->pgsz;
+	zpp->zone_capacity = zone_capacity;
+	zpp->zone_size = roundup_pow_of_two(zone_capacity);
+	zpp->pgs_per_zone = zone_capacity / PG_SIZE;
+
+	media_bytes = zpp->tt_lines * media_pgs_per_line * spp->pgsz;
+	zpp->physical_size = media_bytes;
+	zpp->logical_size = (media_bytes / zpp->zone_size) * zpp->zone_size;
+	zpp->nr_zones = zpp->logical_size / zpp->zone_size;
+
+	NVMEV_INFO("-------------DUAL REALIZE (%s)----------------\n",
+			   location == LOC_PSLC ? "SLC" : "TLC");
+	NVMEV_INFO("[Owned Rows] %llu [Owned Lines] %lu [Physical Capacity] %llu MiB\n",
+			   media_rows, zpp->tt_lines, BYTE_TO_MB(media_bytes));
+	NVMEV_INFO("[Logical Space] %llu MiB [Zone Size] %llu MiB [Zone Capacity] %u MiB "
+			   "[# of Zones] %u\n",
+			   BYTE_TO_MB(zpp->logical_size), BYTE_TO_MB(zpp->zone_size),
+			   BYTE_TO_MB(zpp->zone_capacity), zpp->nr_zones);
+}
+
 static void zms_realize_ftl(struct zms_ftl *zms_ftl)
 {
 	int i, j;
@@ -794,18 +860,28 @@ static void zms_realize_ftl(struct zms_ftl *zms_ftl)
 	zms_ftl->device_full = 0;
 	zms_ftl->pslc_full = 0;
 
+	if (zms_is_dual_ns(zpp->ns_type)) {
+		zms_realize_dual_params(zms_ftl);
+		__init_descriptor((struct zns_ftl *)(&(*zms_ftl)));
+		__init_resource((struct zns_ftl *)(&(*zms_ftl)));
+	}
+
 	__init_l2p(zms_ftl);
 
-	zpp->tt_lines = DIV_ROUND_UP(zpp->physical_size, (ssd->sp.blksz * DIES_PER_ZONE * ssd->sp.pls_per_lun));
-	zpp->pslc_lines = zpp->pslc_blks * ssd->sp.line_groups;
-	zpp->pgs_per_line = ssd->sp.pgs_per_line;
-	zpp->pslc_pgs_per_line = ssd->sp.pslc_pgs_per_line;
+	if (!zms_is_dual_ns(zpp->ns_type)) {
+		zpp->tt_lines =
+			DIV_ROUND_UP(zpp->physical_size, (ssd->sp.blksz * DIES_PER_ZONE * ssd->sp.pls_per_lun));
+		zpp->pslc_lines = zpp->pslc_blks * ssd->sp.line_groups;
+		zpp->pgs_per_line = ssd->sp.pgs_per_line;
+		zpp->pslc_pgs_per_line = ssd->sp.pslc_pgs_per_line;
+	}
 
 	int interleave_sline = 0;
 	int pslc_eline = zpp->pslc_lines;
 
-	if ((zpp->ns_type == SSD_TYPE_CONZONE_ZONED && zpp->pgs_per_zone < ssd->sp.pgs_per_line) ||
-		zpp->tt_lines < 4) {
+	unsigned long media_pgs_per_line =
+		zms_is_dual_ns(zpp->ns_type) ? zpp->pgs_per_line : ssd->sp.pgs_per_line;
+	if ((is_zoned(zpp->ns_type) && zpp->pgs_per_zone < media_pgs_per_line) || zpp->tt_lines < 4) {
 		interleave_sline = zpp->tt_lines;
 	} else if (zpp->pslc_lines < 4) {
 		interleave_sline = zpp->pslc_lines;
@@ -831,7 +907,7 @@ static void zms_realize_ftl(struct zms_ftl *zms_ftl)
 	NVMEV_INFO("[GC Agg Buffer Size] %d lpns\n", zms_ftl->gc_agg_ttlpns);
 	// for pSLC->QLC migration in zoned device
 	zms_ftl->num_aggs = 1;
-	if (zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_ZONED) {
+	if (is_zoned(zms_ftl->zp.ns_type)) {
 		zms_ftl->num_aggs = zms_ftl->zp.nr_zones;
 	}
 	zms_ftl->zone_agg_pgs = kzalloc(sizeof(int) * zms_ftl->num_aggs, GFP_KERNEL);
@@ -978,6 +1054,10 @@ void zms_realize_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t size,
 	struct ssdparams spp;
 	int i;
 	const uint32_t nr_parts = 1; /* Not support multi partitions for zns*/
+#if IS_CONZONE_DUAL
+	void *mapped_addr = ns[0].mapped;
+	uint64_t mapped_off = 0;
+#endif
 
 	ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 	memset(&spp, 0, sizeof(struct ssdparams));
@@ -992,6 +1072,16 @@ void zms_realize_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t size,
 		struct zms_ftl *zms_ftl = (struct zms_ftl *)ns[i].ftls;
 		zms_ftl->ssd = ssd;
 		zms_realize_ftl(zms_ftl);
+#if IS_CONZONE_DUAL
+		zms_ftl->storage_base_addr = (void *)((char *)mapped_addr + mapped_off);
+		ns[i].mapped = zms_ftl->storage_base_addr;
+		ns[i].size = zms_ftl->zp.logical_size;
+		mapped_off += ns[i].size;
+		if (mapped_off > size) {
+			NVMEV_ERROR("dual namespace mapped size %llu MiB exceeds backing size %llu MiB\n",
+						BYTE_TO_MB(mapped_off), BYTE_TO_MB(size));
+		}
+#endif
 		NVMEV_INFO("--------------- realize %s namespace %d ssd %p--------------\n",
 				   is_zoned(zms_ftl->zp.ns_type) ? "zoned" : "block", i, zms_ftl->ssd);
 	}

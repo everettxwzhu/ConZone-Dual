@@ -523,10 +523,14 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	struct nvmev_ns *ns = kmalloc(sizeof(struct nvmev_ns) * nr_ns, GFP_KERNEL);
 
 	for (i = 0; i < nr_ns; i++) {
+#if IS_CONZONE_DUAL
+		size = nvmev_vdev->config.storage_size;
+#else
 		if (NS_CAPACITY(i) == 0)
 			size = remaining_capacity;
 		else
 			size = min(NS_CAPACITY(i), remaining_capacity);
+#endif
 
 		if (NS_SSD_TYPE(i) == SSD_TYPE_NVM)
 			simple_init_namespace(&ns[i], i, size, ns_addr, disp_no);
@@ -534,10 +538,12 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 			conv_init_namespace(&ns[i], i, size, ns_addr, disp_no);
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_init_namespace(&ns[i], i, size, ns_addr, disp_no);
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_ZONED ||
 				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_META ||
-				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_BLOCK)
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_BLOCK ||
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_SLC ||
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_TLC)
 			zms_init_namespace(&ns[i], i, size, ns_addr, disp_no); // SSD is not initialized
 #endif
 		// else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
@@ -545,12 +551,14 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 		else
 			BUG_ON(1);
 
+#if !IS_CONZONE_DUAL
 		remaining_capacity -= size;
 		ns_addr += size;
+#endif
 		NVMEV_INFO("ns %d/%d: size %lld MiB\n", i, nr_ns, BYTE_TO_MB(ns[i].size));
 	}
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	zms_realize_namespaces(ns, nr_ns, nvmev_vdev->config.storage_size, disp_no);
 #endif
 	nvmev_vdev->ns = ns;
@@ -564,7 +572,7 @@ static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 	const int nr_ns = NR_NAMESPACES; // XXX: allow for dynamic nvmev_vdev->nr_ns
 	int i;
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	zms_remove_ssd(ns);
 #endif
 
@@ -575,10 +583,12 @@ static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 			conv_remove_namespace(&ns[i]);
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_remove_namespace(&ns[i]);
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_ZONED ||
 				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_META ||
-				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_BLOCK)
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_BLOCK ||
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_SLC ||
+				 NS_SSD_TYPE(i) == SSD_TYPE_CONZONE_TLC)
 			zms_remove_namespace(&ns[i]);
 #endif
 		// else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
@@ -612,6 +622,9 @@ static void __print_base_config(void)
 		break;
 	case CONZONE_PROTOTYPE:
 		type = "CONZONE SSD Prototype";
+		break;
+	case CONZONE_DUAL_PROTOTYPE:
+		type = "CONZONE Dual SSD Prototype";
 		break;
 	}
 

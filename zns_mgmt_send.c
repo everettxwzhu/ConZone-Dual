@@ -122,8 +122,8 @@ static void __reset_zone(struct zns_ftl *zns_ftl, uint64_t zid, int sqid)
 	if (zns_ftl->zp.zrwa_buffer_size)
 		buffer_refill(&zns_ftl->zrwa_buffer[zid]);
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
-	if (zns_ftl->zp.ns_type == SSD_TYPE_CONZONE_ZONED) {
+#if (IS_CONZONE)
+	if (is_zoned(zns_ftl->zp.ns_type)) {
 		NVMEV_CONZONE_DEBUG("%s zid %llu\n", __func__, zid);
 		zone_reset((struct zms_ftl *)(&(*zns_ftl)), zid, sqid);
 	}

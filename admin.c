@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/highmem.h>
+
 #include "nvmev.h"
 #include "conv_ftl.h"
 #include "zns_ftl.h"
@@ -12,6 +14,66 @@
 #define prp_address_offset(prp, offset) \
 	(page_address(pfn_to_page(prp >> PAGE_SHIFT) + offset) + (prp & ~PAGE_MASK))
 #define prp_address(prp) prp_address_offset(prp, 0)
+
+static int __prp_write_data(__le64 prp1, __le64 prp2, const void *buffer, size_t length)
+{
+	size_t offset = 0;
+	size_t remaining = length;
+	size_t prp_offs = 0;
+	size_t prp2_offs = 0;
+	uint64_t paddr;
+	__le64 *paddr_list = NULL;
+	int ret = 0;
+
+	while (remaining) {
+		size_t io_size;
+		size_t mem_offs = 0;
+		void *vaddr;
+
+		prp_offs++;
+		if (prp_offs == 1) {
+			paddr = le64_to_cpu(prp1);
+		} else if (prp_offs == 2) {
+			paddr = le64_to_cpu(prp2);
+			if (!paddr) {
+				ret = -EINVAL;
+				break;
+			}
+			if (remaining > PAGE_SIZE) {
+				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
+							 (paddr & PAGE_OFFSET_MASK);
+				paddr = le64_to_cpu(paddr_list[prp2_offs++]);
+			}
+		} else {
+			paddr = le64_to_cpu(paddr_list[prp2_offs++]);
+		}
+
+		if (!paddr) {
+			ret = -EINVAL;
+			break;
+		}
+
+		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+		io_size = min_t(size_t, remaining, PAGE_SIZE);
+
+		if (paddr & PAGE_OFFSET_MASK) {
+			mem_offs = paddr & PAGE_OFFSET_MASK;
+			if (io_size + mem_offs > PAGE_SIZE)
+				io_size = PAGE_SIZE - mem_offs;
+		}
+
+		memcpy(vaddr + mem_offs, (const char *)buffer + offset, io_size);
+		kunmap_atomic(vaddr);
+
+		remaining -= io_size;
+		offset += io_size;
+	}
+
+	if (paddr_list)
+		kunmap_atomic(paddr_list);
+
+	return ret;
+}
 
 static void __make_cq_entry_results(int eid, u16 ret, u32 result0, u32 result1)
 {
@@ -200,7 +262,8 @@ static void __nvmev_admin_get_log_page(int eid)
 				},
 			.iocs =
 				{
-#if (SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED))
+#if (SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED) || \
+	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 					/*
 					 * Zone Append is unsupported at the moment, but we fake it so that
 					 * Linux device driver doesn't lock it to R/O.
@@ -252,9 +315,13 @@ static void __nvmev_admin_identify_namespace(int eid)
 	struct nvme_id_ns *ns;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	size_t nsid = cmd->nsid - 1;
+	u16 status;
 
-	ns = prp_address(cmd->prp1);
-	memset(ns, 0x0, PAGE_SIZE);
+	ns = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!ns) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
+		return;
+	}
 
 	ns->lbaf[0].ms = 0;
 	ns->lbaf[0].ds = 9;
@@ -299,27 +366,41 @@ static void __nvmev_admin_identify_namespace(int eid)
 	ns->ncap = ns->nsze;
 	ns->nuse = ns->nsze;
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	status = __prp_write_data(cmd->prp1, cmd->prp2, ns, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(ns);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify_namespaces(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
-	unsigned int *ns;
+	__le32 *ns;
+	__le32 *entry;
+	u16 status;
 	int i;
 
-	ns = prp_address(cmd->prp1);
-	memset(ns, 0x00, PAGE_SIZE * 2);
+	ns = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!ns) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
+		return;
+	}
 
+	entry = ns;
 	for (i = 1; i <= nvmev_vdev->nr_ns; i++) {
 		if (i > cmd->nsid) {
-			*ns = i;
-			ns++;
+			*entry = cpu_to_le32(i);
+			entry++;
 		}
 	}
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	status = __prp_write_data(cmd->prp1, cmd->prp2, ns, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(ns);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify_namespace_desc(int eid)
@@ -328,16 +409,24 @@ static void __nvmev_admin_identify_namespace_desc(int eid)
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	struct nvme_id_ns_desc *ns_desc;
 	int nsid = cmd->nsid - 1;
+	u16 status;
 
-	ns_desc = prp_address(cmd->prp1);
-	memset(ns_desc, 0x00, sizeof(*ns_desc));
+	ns_desc = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!ns_desc) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
+		return;
+	}
 
 	ns_desc->nidt = NVME_NIDT_CSI;
 	ns_desc->nidl = 1;
 
 	ns_desc->nid[0] = nvmev_vdev->ns[nsid].csi; // Zoned Name Space Command Set
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	status = __prp_write_data(cmd->prp1, cmd->prp2, ns_desc, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(ns_desc);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify_zns_namespace(int eid)
@@ -348,42 +437,53 @@ static void __nvmev_admin_identify_zns_namespace(int eid)
 	int nsid = cmd->nsid - 1;
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)nvmev_vdev->ns[nsid].ftls;
 	struct znsparams *zpp = &zns_ftl->zp;
+	u16 status;
+	int i;
 
-	if (NS_SSD_TYPE(nsid) != SSD_TYPE_ZNS && NS_SSD_TYPE(nsid) != SSD_TYPE_CONZONE_ZONED) {
-		__make_cq_entry(eid, NVME_SC_SUCCESS);
+	ns = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!ns) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
 		return;
 	}
-	BUG_ON(nvmev_vdev->ns[nsid].csi != NVME_CSI_ZNS);
 
-	ns = prp_address(cmd->prp1);
-	memset(ns, 0x00, sizeof(*ns));
+	if (!is_zoned(NS_SSD_TYPE(nsid)))
+		goto out;
+
+	BUG_ON(nvmev_vdev->ns[nsid].csi != NVME_CSI_ZNS);
 
 	ns->zoc = 0; // currently not support variable zone capacity
 	ns->ozcs = 0;
-	ns->mar = zpp->nr_active_zones - 1; // 0-based
+	ns->mar = cpu_to_le32(zpp->nr_active_zones - 1); // 0-based
 
-	ns->mor = zpp->nr_open_zones - 1; // 0-based
+	ns->mor = cpu_to_le32(zpp->nr_open_zones - 1); // 0-based
 
 	/* zrwa enabled */
 	if (zpp->nr_zrwa_zones > 0) {
 		ns->ozcs |= OZCS_ZRWA; // Support ZRWA
 
-		ns->numzrwa = zpp->nr_zrwa_zones - 1;
+		ns->numzrwa = cpu_to_le32(zpp->nr_zrwa_zones - 1);
 
-		ns->zrwafg = zpp->zrwafg_size;
+		ns->zrwafg = cpu_to_le16(zpp->zrwafg_size);
 
-		ns->zrwasz = zpp->zrwa_size;
+		ns->zrwasz = cpu_to_le16(zpp->zrwa_size);
 
 		ns->zrwacap = 0; // explicit zrwa flush
 		ns->zrwacap |= ZRWACAP_EXPFLUSHSUP;
 	}
-	// Zone Size
-	ns->lbaf[0].zsze = BYTE_TO_LBA(zpp->zone_size);
+	for (i = 0; i < NVME_ZNS_MAX_LBAF; i++) {
+		// Zone Size
+		ns->lbaf[i].zsze = cpu_to_le64(BYTE_TO_LBA(zpp->zone_size));
 
-	// Zone Descriptor Extension Size
-	ns->lbaf[0].zdes = 0; // currently not support
+		// Zone Descriptor Extension Size
+		ns->lbaf[i].zdes = 0; // currently not support
+	}
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+out:
+	status = __prp_write_data(cmd->prp1, cmd->prp2, ns, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(ns);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify_zns_ctrl(int eid)
@@ -391,12 +491,21 @@ static void __nvmev_admin_identify_zns_ctrl(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	struct nvme_id_zns_ctrl *res;
+	u16 status;
 
-	res = prp_address(cmd->prp1);
+	res = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!res) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
+		return;
+	}
 
 	res->zasl = 0; // currently not support zone append command
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	status = __prp_write_data(cmd->prp1, cmd->prp2, res, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(res);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify_ctrl(int eid)
@@ -404,9 +513,13 @@ static void __nvmev_admin_identify_ctrl(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	struct nvme_id_ctrl *ctrl;
+	u16 status;
 
-	ctrl = prp_address(cmd->prp1);
-	memset(ctrl, 0x00, sizeof(*ctrl));
+	ctrl = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!ctrl) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL);
+		return;
+	}
 
 	ctrl->nn = nvmev_vdev->nr_ns;
 	ctrl->oncs = 0; // optional command
@@ -421,7 +534,11 @@ static void __nvmev_admin_identify_ctrl(int eid)
 	ctrl->sqes = 0x66;
 	ctrl->cqes = 0x44;
 
-	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	status = __prp_write_data(cmd->prp1, cmd->prp2, ctrl, PAGE_SIZE) ?
+				 NVME_SC_DATA_XFER_ERROR :
+				 NVME_SC_SUCCESS;
+	kfree(ctrl);
+	__make_cq_entry(eid, status);
 }
 
 static void __nvmev_admin_identify(int eid)

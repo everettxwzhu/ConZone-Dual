@@ -10,7 +10,8 @@
 #include "dma.h"
 
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED) || \
-	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META))
+	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META) ||                    \
+	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 #include "ssd.h"
 #else
 struct buffer;
@@ -634,7 +635,8 @@ static int nvmev_io_worker(void *data)
 			if (w->nsecs_target <= curr_nsecs) {
 				if (w->is_internal) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED) || \
-	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META))
+	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META) ||                    \
+	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 					buffer_release((struct buffer *)w->write_buffer, w->buffs_to_release);
 #endif
 				} else {

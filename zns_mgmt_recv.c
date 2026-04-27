@@ -5,6 +5,7 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/vmalloc.h>
 
 #include "nvmev.h"
 #include "ssd.h"
@@ -71,30 +72,28 @@ static uint64_t __prp_transfer_data(uint64_t prp1, uint64_t prp2, void *buffer, 
 }
 
 static void __fill_zone_report(struct zns_ftl *zns_ftl, struct nvme_zone_mgmt_recv *cmd,
-							   struct zone_report *report)
+							   struct zone_report *report, uint64_t report_len)
 {
 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
 	uint64_t slba = cmd->slba;
 	uint64_t start_zid = lba_to_zone(zns_ftl, slba);
-
-	uint64_t bytes_transfer = (cmd->nr_dw + 1) * sizeof(uint32_t);
-
-	uint64_t nr_zone_to_report;
+	uint64_t nr_zones_avail = zns_ftl->zp.nr_zones - start_zid;
+	uint64_t nr_desc_to_copy = 0;
+	uint64_t max_descs;
 
 	if (cmd->zra_specific_features == 0) // all
-		nr_zone_to_report = zns_ftl->zp.nr_zones - start_zid;
+		report->nr_zones = cpu_to_le64(nr_zones_avail);
 	else // partial. # of zone desc transferred
-		nr_zone_to_report = (bytes_transfer / sizeof(struct zone_descriptor)) - 1;
+		report->nr_zones = cpu_to_le64(nr_zones_avail);
 
-	if (nr_zone_to_report > zns_ftl->zp.nr_zones - start_zid) {
-		// Userspace asked for zones exceeding the device limit, adjust nr_zones
-		nr_zone_to_report = zns_ftl->zp.nr_zones - start_zid;
-	}
+	if (report_len <= sizeof(*report))
+		return;
 
-	report->nr_zones = nr_zone_to_report;
+	max_descs = (report_len - sizeof(*report)) / sizeof(struct zone_descriptor);
+	nr_desc_to_copy = min_t(uint64_t, nr_zones_avail, max_descs);
 
 	memcpy(report->zd, &(zone_descs[start_zid]),
-		   sizeof(struct zone_descriptor) * nr_zone_to_report);
+		   sizeof(struct zone_descriptor) * nr_desc_to_copy);
 }
 
 static bool __check_zmgmt_rcv_option_supported(struct zns_ftl *zns_ftl,
@@ -121,7 +120,7 @@ static bool __check_zmgmt_rcv_option_supported(struct zns_ftl *zns_ftl,
 void zns_zmgmt_recv(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
-	struct zone_report *buffer = zns_ftl->report_buffer;
+	struct zone_report *buffer;
 	struct nvme_zone_mgmt_recv *cmd = (struct nvme_zone_mgmt_recv *)req->cmd;
 
 	uint64_t prp1 = (uint64_t)cmd->prp1;
@@ -134,14 +133,22 @@ void zns_zmgmt_recv(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev
 					cmd->zra_specific_field);
 
 	if (__check_zmgmt_rcv_option_supported(zns_ftl, cmd)) {
-		__fill_zone_report(zns_ftl, cmd, buffer);
+		buffer = kvzalloc(length, GFP_KERNEL);
+		if (!buffer) {
+			status = NVME_SC_INTERNAL;
+			goto out;
+		}
+
+		__fill_zone_report(zns_ftl, cmd, buffer, length);
 
 		__prp_transfer_data(prp1, prp2, buffer, length, 0);
+		kvfree(buffer);
 		status = NVME_SC_SUCCESS;
 	} else {
 		status = NVME_SC_INVALID_FIELD;
 	}
 
+out:
 	ret->nsecs_target = req->nsecs_start; // no delay
 	ret->status = status;
 	return;
