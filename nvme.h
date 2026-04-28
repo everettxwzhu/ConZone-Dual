@@ -327,7 +327,8 @@ struct nvme_reservation_status {
 																				op(nvme_cmd_kv_iter_req, 0xB1)      \
 																					op(nvme_cmd_kv_iter_read, 0xB2) \
 																						op(nvme_cmd_kv_exist, 0xB3) \
-																							op(nvme_cmd_kv_batch, 0x85)
+																							op(nvme_cmd_kv_batch, 0x85) \
+																								op(nvme_cmd_cross_ns_copy, 0xC0)
 
 #define ENUM_NVME_OP(name, value) name = value,
 #define STRING_NVME_OP(name, value) [name] = #name,
@@ -371,6 +372,20 @@ struct nvme_rw_command {
 	__le16 apptag;
 	__le16 appmask;
 };
+
+struct nvme_cross_ns_copy_command {
+	__u8 opcode;
+	__u8 flags;
+	__u16 command_id;
+	__le32 nsid;
+	__u64 rsvd2[4];
+	__le64 src_slba;
+	__le32 dst_nsid;
+	__le32 dst_slba_lo;
+	__le32 dst_slba_hi;
+	__le32 cdw15;
+};
+static_assert(sizeof(struct nvme_cross_ns_copy_command) == 64);
 
 struct nvme_get_log_page_command {
 	__u8 opcode;
@@ -628,6 +643,7 @@ struct nvme_command {
 		struct nvme_format_cmd format;
 		struct nvme_dsm_cmd dsm;
 		struct nvme_abort_cmd abort;
+		struct nvme_cross_ns_copy_command cross_ns_copy;
 	};
 };
 

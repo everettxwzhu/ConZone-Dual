@@ -55,6 +55,14 @@ static inline bool __cmd_has_storage_payload(struct nvme_rw_command *cmd)
 		   cmd->opcode == nvme_cmd_read;
 }
 
+static inline size_t __cmd_accounted_io_size(struct nvme_command *cmd)
+{
+	if (!__cmd_has_storage_payload(&cmd->rw))
+		return 0;
+
+	return __cmd_io_size(&cmd->rw);
+}
+
 static bool __cmd_ns_range(struct nvme_rw_command *cmd, size_t *nsid, size_t *offset,
 						   size_t *length)
 {
@@ -355,6 +363,8 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	w->nsecs_enqueue = local_clock();
 	w->nsecs_target = ret->nsecs_target;
 	w->status = ret->status;
+	w->result0 = ret->result0;
+	w->result1 = ret->result1;
 	w->is_completed = false;
 	w->is_copied = false;
 	w->prev = -1;
@@ -493,7 +503,7 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 
 	if (!ns->proc_io_cmd(ns, &req, &ret))
 		return false;
-	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
+	*io_size = __cmd_accounted_io_size(cmd);
 
 #ifdef PERF_DEBUG
 	prev_clock2 = local_clock();

@@ -37,6 +37,7 @@ enum io_types {
 	GC_IO = 1,
 	MIGRATE_IO = 2,
 	MAP_READ_IO = 3, // do not use in write operations
+	CROSS_NS_COPY_IO = 4,
 };
 
 enum page_status {

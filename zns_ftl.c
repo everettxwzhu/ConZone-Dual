@@ -304,6 +304,10 @@ bool zms_zoned_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 		if (!zoned_read(ns, req, ret))
 			return false;
 		break;
+	case nvme_cmd_cross_ns_copy:
+		if (!zms_cross_ns_copy(ns, req, ret))
+			return false;
+		break;
 	case nvme_cmd_flush:
 		zns_flush(ns, req, ret);
 		break;
@@ -1009,6 +1013,11 @@ void zms_print_statistic_info(struct zms_ftl *zms_ftl)
 	NVMEV_INFO("[flush_to_regular] %d\n", zms_ftl->flush_to_regular);
 	NVMEV_INFO("[device_copy_pgs] %d [Migrated Logical Pages] %lld [GC Logical Pages] %lld\n",
 			   zms_ftl->device_copy_pgs, zms_ftl->migration_pgs, zms_ftl->gc_pgs);
+	NVMEV_INFO("[Cross NS Copy] cnt %lld lbas %lld fail %lld slc_to_tlc_pgs %lld "
+			   "tlc_to_slc_pgs %lld\n",
+			   zms_ftl->cross_ns_copy_cnt, zms_ftl->cross_ns_copy_lbas,
+			   zms_ftl->cross_ns_copy_fail_cnt, zms_ftl->cross_ns_slc_to_tlc_pgs,
+			   zms_ftl->cross_ns_tlc_to_slc_pgs);
 	NVMEV_INFO("[avg lock wait time] %lld / %lld\n", zms_ftl->avg_wait_for_lock,
 			   zms_ftl->host_wrequest_cnt);
 }

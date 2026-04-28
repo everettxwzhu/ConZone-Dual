@@ -274,6 +274,8 @@ static void __nvmev_admin_get_log_page(int eid)
 					[nvme_cmd_zone_mgmt_send] =
 						cpu_to_le32(NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC),
 					[nvme_cmd_zone_mgmt_recv] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
+					[nvme_cmd_cross_ns_copy] =
+						cpu_to_le32(NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC),
 #endif
 				},
 			.resv =

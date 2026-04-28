@@ -273,6 +273,11 @@ struct zms_ftl {
 	int flush_to_slc;	  // for debug
 	int flush_to_regular; // for debug
 	int device_copy_pgs;  // for debug
+	uint64_t cross_ns_copy_cnt;
+	uint64_t cross_ns_copy_lbas;
+	uint64_t cross_ns_copy_fail_cnt;
+	uint64_t cross_ns_slc_to_tlc_pgs;
+	uint64_t cross_ns_tlc_to_slc_pgs;
 	uint64_t lock_last_stime;
 	uint64_t avg_wait_for_lock; // for debug
 
@@ -487,6 +492,7 @@ bool block_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_re
 bool block_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
 bool zoned_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
 bool zoned_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
+bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret);
 void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid);
 void zms_print_statistic_info(struct zms_ftl *zms_ftl);
 struct ppa get_maptbl_ent(struct zms_ftl *zms_ftl, uint64_t lpn);

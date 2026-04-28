@@ -1744,6 +1744,12 @@ static uint64_t nand_write(struct zms_ftl *zms_ftl, uint64_t nsecs_start, uint64
 		}
 	}
 
+	if (io_type == CROSS_NS_COPY_IO &&
+		get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE && location == LOC_PSLC) {
+		consume_write_credit(zms_ftl, location);
+		check_and_refill_write_credit(zms_ftl, location);
+	}
+
 	if (io_type != GC_IO) {
 		if (zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_META ||
 			(zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_BLOCK && location == LOC_NORMAL) ||
@@ -3252,6 +3258,346 @@ static bool handle_read_request(struct zms_ftl *zms_ftl, struct nvmev_request *r
 	// 			 (ret->nsecs_target - req->nsecs_start) / 1000);
 	// NVMEV_INFO("%s slpn %lld nr_pgs %lld  lat %lld us\n ", __func__, slpn,
 	// 		   nr_lba / spp->secs_per_pg, (ret->nsecs_target - nsecs_start) / 1000);
+	return true;
+}
+
+static bool zms_zone_start_lba(struct zms_ftl *zms_ftl, uint64_t slba, uint32_t *zid)
+{
+	if (!is_zoned(zms_ftl->zp.ns_type))
+		return false;
+	if (slba >= BYTE_TO_LBA(zms_ftl->zp.logical_size))
+		return false;
+
+	*zid = lba_to_zone((struct zns_ftl *)(&(*zms_ftl)), slba);
+	if (*zid >= zms_ftl->zp.nr_zones)
+		return false;
+
+	return zone_to_slba((struct zns_ftl *)(&(*zms_ftl)), *zid) == slba;
+}
+
+static struct buffer *zms_find_zone_buffer(struct zms_ftl *zms_ftl, uint32_t zid)
+{
+	if (!zms_ftl->write_buffer)
+		return NULL;
+
+	for (int i = 0; i < zms_ftl->zp.nr_wb; i++) {
+		if (zms_ftl->write_buffer[i].zid == zid)
+			return &zms_ftl->write_buffer[i];
+	}
+
+	return NULL;
+}
+
+static bool zms_drain_zone_write_buffer(struct zms_ftl *zms_ftl, uint32_t zid,
+										struct nvmev_request *req)
+{
+	struct buffer *write_buffer = zms_find_zone_buffer(zms_ftl, zid);
+	uint64_t nsecs_latest;
+
+	if (!write_buffer)
+		return true;
+
+	if (is_buffer_busy(write_buffer))
+		return false;
+
+	if (!write_buffer->flush_data && !write_buffer->pgs)
+		return true;
+
+	if (buffer_allocate(write_buffer, 0) == 0)
+		return false;
+
+	nsecs_latest = buffer_flush(zms_ftl, write_buffer, req->nsecs_start);
+	schedule_internal_operation(req->sq_id, nsecs_latest, write_buffer, 0);
+	return false;
+}
+
+static uint32_t zms_check_target_zone_buffer(struct zms_ftl *zms_ftl, uint32_t zid)
+{
+	struct buffer *write_buffer = zms_find_zone_buffer(zms_ftl, zid);
+
+	if (!write_buffer)
+		return NVME_SC_SUCCESS;
+	if (is_buffer_busy(write_buffer))
+		return NVME_SC_NS_NOT_READY;
+	if (write_buffer->flush_data || write_buffer->pgs)
+		return NVME_SC_INVALID_FIELD;
+
+	return NVME_SC_SUCCESS;
+}
+
+static uint32_t zms_open_empty_zone_for_copy(struct zms_ftl *zms_ftl, uint32_t zid)
+{
+	struct zone_descriptor *zone_descs = zms_ftl->zone_descs;
+
+	if (zone_descs[zid].state != ZONE_STATE_EMPTY || zone_descs[zid].wp != zone_descs[zid].zslba)
+		return NVME_SC_INVALID_FIELD;
+
+	if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE))
+		return NVME_SC_ZNS_NO_ACTIVE_ZONE;
+	if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE))
+		return NVME_SC_ZNS_NO_OPEN_ZONE;
+
+	acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
+	if (acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE) == false) {
+		release_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
+		return NVME_SC_ZNS_NO_OPEN_ZONE;
+	}
+
+	change_zone_state((struct zns_ftl *)(&(*zms_ftl)), zid, ZONE_STATE_OPENED_IMPL);
+	return NVME_SC_SUCCESS;
+}
+
+static uint32_t zms_validate_cross_ns_copy(struct zms_ftl *src_ftl, struct zms_ftl *dst_ftl,
+										   uint32_t src_zid, uint32_t dst_zid,
+										   uint64_t *copy_nlb)
+{
+	struct zone_descriptor *src_zone = &src_ftl->zone_descs[src_zid];
+	struct zone_descriptor *dst_zone = &dst_ftl->zone_descs[dst_zid];
+	struct ssdparams *spp = &src_ftl->ssd->sp;
+
+	if (!zms_is_dual_ns(src_ftl->zp.ns_type) || !zms_is_dual_ns(dst_ftl->zp.ns_type))
+		return NVME_SC_INVALID_FIELD;
+
+	if (src_ftl->ssd != dst_ftl->ssd)
+		return NVME_SC_INVALID_FIELD;
+
+	switch (src_zone->state) {
+	case ZONE_STATE_EMPTY:
+	case ZONE_STATE_OPENED_IMPL:
+	case ZONE_STATE_OPENED_EXPL:
+	case ZONE_STATE_CLOSED:
+	case ZONE_STATE_FULL:
+	case ZONE_STATE_READ_ONLY:
+		break;
+	case ZONE_STATE_OFFLINE:
+		return NVME_SC_ZNS_ERR_OFFLINE;
+	default:
+		return NVME_SC_ZNS_INVALID_ZONE_OPERATION;
+	}
+
+	if (src_zone->wp < src_zone->zslba ||
+		src_zone->wp > src_zone->zslba + src_zone->zone_capacity) {
+		NVMEV_ERROR("ns %d bad source wp zid %u zslba %llu wp %llu cap %llu\n",
+					src_ftl->zp.ns->id, src_zid, src_zone->zslba, src_zone->wp,
+					src_zone->zone_capacity);
+		return NVME_SC_INTERNAL;
+	}
+
+	*copy_nlb = src_zone->wp - src_zone->zslba;
+	if (dst_zone->state != ZONE_STATE_EMPTY || dst_zone->wp != dst_zone->zslba)
+		return NVME_SC_INVALID_FIELD;
+
+	if (*copy_nlb == 0)
+		return zms_check_target_zone_buffer(dst_ftl, dst_zid);
+
+	if ((*copy_nlb % spp->secs_per_pg) != 0)
+		return NVME_SC_INVALID_FIELD;
+
+	if (*copy_nlb > dst_zone->zone_capacity)
+		return NVME_SC_INVALID_FIELD;
+
+	return zms_check_target_zone_buffer(dst_ftl, dst_zid);
+}
+
+static uint32_t zms_prescan_source_zone(struct zms_ftl *src_ftl, uint32_t src_zid,
+										uint64_t src_slpn, uint64_t copy_pgs)
+{
+	struct zone_descriptor *src_zone = &src_ftl->zone_descs[src_zid];
+
+	for (uint64_t i = 0; i < copy_pgs; i++) {
+		uint64_t lpn = src_slpn + i;
+		struct ppa ppa = get_maptbl_ent(src_ftl, lpn);
+
+		if (!mapped_ppa(&ppa)) {
+			NVMEV_ERROR("CROSS_NS_COPY source hole: ns %d zid %u lpn %llu wp %llu\n",
+						src_ftl->zp.ns->id, src_zid, lpn, src_zone->wp);
+			WARN_ON_ONCE(1);
+			return NVME_SC_INTERNAL;
+		}
+	}
+
+	return NVME_SC_SUCCESS;
+}
+
+static void zms_cross_ns_update_stats(struct zms_ftl *src_ftl, struct zms_ftl *dst_ftl,
+									  uint64_t copied_pgs)
+{
+	src_ftl->cross_ns_copy_cnt++;
+	src_ftl->cross_ns_copy_lbas += copied_pgs * src_ftl->ssd->sp.secs_per_pg;
+
+	if (src_ftl->zp.ns_type == SSD_TYPE_CONZONE_SLC &&
+		dst_ftl->zp.ns_type == SSD_TYPE_CONZONE_TLC) {
+		src_ftl->cross_ns_slc_to_tlc_pgs += copied_pgs;
+	} else if (src_ftl->zp.ns_type == SSD_TYPE_CONZONE_TLC &&
+			   dst_ftl->zp.ns_type == SSD_TYPE_CONZONE_SLC) {
+		src_ftl->cross_ns_tlc_to_slc_pgs += copied_pgs;
+	}
+}
+
+bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+{
+	struct nvme_cross_ns_copy_command *cmd = &req->cmd->cross_ns_copy;
+	struct zms_ftl *src_ftl = (struct zms_ftl *)ns->ftls;
+	struct zms_ftl *dst_ftl;
+	struct nvmev_ns *dst_ns;
+	struct ssdparams *spp;
+	uint32_t src_nsid = cmd->nsid;
+	uint32_t dst_nsid = cmd->dst_nsid;
+	uint64_t src_slba = cmd->src_slba;
+	uint64_t dst_slba = ((uint64_t)cmd->dst_slba_hi << 32) | cmd->dst_slba_lo;
+	uint32_t src_zid, dst_zid;
+	uint64_t copy_nlb = 0, copy_pgs = 0, copied_pgs = 0;
+	uint64_t src_slpn, dst_slpn;
+	uint64_t nsecs_latest = req->nsecs_start;
+	uint64_t *src_lpns = NULL;
+	uint32_t batch_pgs;
+	uint32_t status = NVME_SC_SUCCESS;
+	int dst_loc;
+	int to_write_pgs = 0;
+
+	ret->result0 = 0;
+	ret->result1 = 0;
+	ret->nsecs_target = req->nsecs_start;
+
+	if (cmd->cdw15 != 0 || src_nsid == 0 || dst_nsid == 0 ||
+		src_nsid > nvmev_vdev->nr_ns || dst_nsid > nvmev_vdev->nr_ns) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+
+	if (src_nsid - 1 != ns->id) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+
+	dst_ns = &nvmev_vdev->ns[dst_nsid - 1];
+	if (dst_ns->csi != NVME_CSI_ZNS) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+	dst_ftl = (struct zms_ftl *)dst_ns->ftls;
+
+	if (!src_ftl || !dst_ftl || !src_ftl->ssd || src_ftl->ssd != dst_ftl->ssd) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+	spp = &src_ftl->ssd->sp;
+
+	if (src_ftl == dst_ftl && src_slba == dst_slba) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+
+	if (!zms_zone_start_lba(src_ftl, src_slba, &src_zid) ||
+		!zms_zone_start_lba(dst_ftl, dst_slba, &dst_zid)) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+
+	if (src_ftl == dst_ftl && src_zid == dst_zid) {
+		status = NVME_SC_INVALID_FIELD;
+		goto out;
+	}
+
+	status = zms_validate_cross_ns_copy(src_ftl, dst_ftl, src_zid, dst_zid, &copy_nlb);
+	if (status != NVME_SC_SUCCESS)
+		goto out;
+
+	if (!zms_drain_zone_write_buffer(src_ftl, src_zid, req))
+		return false;
+
+	if (copy_nlb == 0) {
+		zms_cross_ns_update_stats(src_ftl, dst_ftl, 0);
+		goto out;
+	}
+
+	copy_pgs = copy_nlb / spp->secs_per_pg;
+	src_slpn = lba_to_lpn((struct zns_ftl *)(&(*src_ftl)), src_slba);
+	dst_slpn = lba_to_lpn((struct zns_ftl *)(&(*dst_ftl)), dst_slba);
+
+	status = zms_prescan_source_zone(src_ftl, src_zid, src_slpn, copy_pgs);
+	if (status != NVME_SC_SUCCESS)
+		goto out;
+
+	dst_loc = zms_dual_target_loc(dst_ftl->zp.ns_type);
+	batch_pgs = dst_loc == LOC_PSLC ? spp->pslc_pgs_per_oneshotpg : spp->pgs_per_oneshotpg;
+	if (batch_pgs == 0) {
+		status = NVME_SC_INTERNAL;
+		goto out;
+	}
+
+	src_lpns = kmalloc(sizeof(uint64_t) * batch_pgs, GFP_KERNEL);
+	if (!src_lpns) {
+		status = NVME_SC_INTERNAL;
+		goto out;
+	}
+
+	status = zms_open_empty_zone_for_copy(dst_ftl, dst_zid);
+	if (status != NVME_SC_SUCCESS)
+		goto out;
+
+	src_ftl->current_time = req->nsecs_start;
+	dst_ftl->current_time = req->nsecs_start;
+
+	while (copied_pgs < copy_pgs) {
+		uint64_t batch = min_t(uint64_t, batch_pgs, copy_pgs - copied_pgs);
+		uint64_t nsecs_read_done;
+		uint64_t nsecs_write_start;
+
+		for (uint64_t i = 0; i < batch; i++)
+			src_lpns[i] = src_slpn + copied_pgs + i;
+
+		nsecs_read_done = nand_read(src_ftl, src_lpns, 0, batch, CROSS_NS_COPY_IO, nsecs_latest);
+		nsecs_latest = max(nsecs_latest, nsecs_read_done);
+		nsecs_write_start = nsecs_read_done;
+
+		for (uint64_t i = 0; i < batch; i++) {
+			uint64_t src_lpn = src_slpn + copied_pgs;
+			uint64_t dst_lpn = dst_slpn + copied_pgs;
+			uint64_t dst_elpn = dst_slpn + copy_pgs - 1;
+			uint64_t nsecs_write_done;
+			struct ppa dst_ppa;
+
+			to_write_pgs++;
+			nsecs_write_done = nand_write(dst_ftl, nsecs_write_start, dst_lpn, dst_loc,
+										  CROSS_NS_COPY_IO, to_write_pgs, dst_elpn);
+			if (nsecs_write_done != nsecs_write_start)
+				to_write_pgs = 0;
+			nsecs_latest = max(nsecs_latest, nsecs_write_done);
+
+			dst_ppa = get_maptbl_ent(dst_ftl, dst_lpn);
+			if (!mapped_ppa(&dst_ppa)) {
+				status = (dst_loc == LOC_PSLC && dst_ftl->pslc_full) ||
+								 (dst_loc == LOC_NORMAL && dst_ftl->device_full)
+							 ? NVME_SC_CAP_EXCEEDED
+							 : NVME_SC_INTERNAL;
+				goto copy_done;
+			}
+
+			memcpy((char *)dst_ns->mapped + dst_lpn * spp->pgsz,
+				   (char *)ns->mapped + src_lpn * spp->pgsz, spp->pgsz);
+			__increase_write_ptr((struct zns_ftl *)(&(*dst_ftl)), dst_zid, spp->secs_per_pg);
+			copied_pgs++;
+			ret->result0 = copied_pgs * spp->secs_per_pg;
+
+			if ((dst_loc == LOC_PSLC && dst_ftl->pslc_full) ||
+				(dst_loc == LOC_NORMAL && dst_ftl->device_full)) {
+				status = NVME_SC_CAP_EXCEEDED;
+				goto copy_done;
+			}
+		}
+	}
+
+copy_done:
+	if (copied_pgs)
+		zms_cross_ns_update_stats(src_ftl, dst_ftl, copied_pgs);
+
+out:
+	if (status != NVME_SC_SUCCESS)
+		src_ftl->cross_ns_copy_fail_cnt++;
+	kfree(src_lpns);
+	ret->status = status;
+	ret->nsecs_target = nsecs_latest;
 	return true;
 }
 
