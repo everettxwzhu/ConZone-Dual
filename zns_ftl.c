@@ -364,7 +364,7 @@ static void zms_init_params(struct znsparams *zpp, uint64_t physical_size, struc
 	if (zms_is_dual_ns(ns_type)) {
 		uint32_t zone_program_unit = ns_type == SSD_TYPE_CONZONE_SLC ? pSLC_ONESHOT_PAGE_SIZE * PLNS_PER_ZONE : ONESHOT_PAGE_SIZE * PLNS_PER_ZONE;
 
-		zpp->logical_size = 0;
+		zpp->logical_size = physical_size;
 		zpp->nr_wb = max_t(uint32_t, 1, ZONE_WB_SIZE / zone_program_unit);
 		zpp->zone_wb_size = ZONE_WB_SIZE;
 		zpp->pslc_blks = ns_type == SSD_TYPE_CONZONE_SLC ? DUAL_SLC_INIT_BLKS : 0;
@@ -823,12 +823,18 @@ static void zms_realize_dual_params(struct zms_ftl *zms_ftl)
 
 	zone_capacity = media_pgs_per_line * spp->pgsz;
 	zpp->zone_capacity = zone_capacity;
-	zpp->zone_size = roundup_pow_of_two(zone_capacity);
+	zpp->zone_size = zone_capacity;
 	zpp->pgs_per_zone = zone_capacity / PG_SIZE;
 
 	media_bytes = zpp->tt_lines * media_pgs_per_line * spp->pgsz;
 	zpp->physical_size = media_bytes;
-	zpp->logical_size = (media_bytes / zpp->zone_size) * zpp->zone_size;
+	zpp->logical_size = media_bytes;
+	if (zpp->ns && zpp->ns->size != zpp->logical_size) {
+		NVMEV_ERROR("dual namespace %d configured size %llu MiB differs from media size %llu MiB\n",
+					zpp->ns->id, BYTE_TO_MB(zpp->ns->size), BYTE_TO_MB(zpp->logical_size));
+		BUG_ON(1);
+	}
+	NVMEV_ASSERT((zpp->logical_size % zpp->zone_size) == 0);
 	zpp->nr_zones = zpp->logical_size / zpp->zone_size;
 
 	NVMEV_INFO("-------------DUAL REALIZE (%s)----------------\n",
@@ -1054,10 +1060,6 @@ void zms_realize_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t size,
 	struct ssdparams spp;
 	int i;
 	const uint32_t nr_parts = 1; /* Not support multi partitions for zns*/
-#if IS_CONZONE_DUAL
-	void *mapped_addr = ns[0].mapped;
-	uint64_t mapped_off = 0;
-#endif
 
 	ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 	memset(&spp, 0, sizeof(struct ssdparams));
@@ -1071,15 +1073,15 @@ void zms_realize_namespaces(struct nvmev_ns *ns, int nr_ns, uint64_t size,
 		}
 		struct zms_ftl *zms_ftl = (struct zms_ftl *)ns[i].ftls;
 		zms_ftl->ssd = ssd;
+#if IS_CONZONE_DUAL
+		zms_ftl->storage_base_addr = ns[i].mapped;
+#endif
 		zms_realize_ftl(zms_ftl);
 #if IS_CONZONE_DUAL
-		zms_ftl->storage_base_addr = (void *)((char *)mapped_addr + mapped_off);
-		ns[i].mapped = zms_ftl->storage_base_addr;
-		ns[i].size = zms_ftl->zp.logical_size;
-		mapped_off += ns[i].size;
-		if (mapped_off > size) {
-			NVMEV_ERROR("dual namespace mapped size %llu MiB exceeds backing size %llu MiB\n",
-						BYTE_TO_MB(mapped_off), BYTE_TO_MB(size));
+		if (ns[i].size != zms_ftl->zp.logical_size) {
+			NVMEV_ERROR("dual namespace %d size %llu MiB differs from ftl logical size %llu MiB\n",
+						i, BYTE_TO_MB(ns[i].size), BYTE_TO_MB(zms_ftl->zp.logical_size));
+			BUG_ON(1);
 		}
 #endif
 		NVMEV_INFO("--------------- realize %s namespace %d ssd %p--------------\n",

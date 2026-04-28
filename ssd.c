@@ -183,8 +183,13 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	if (BLKS_PER_PLN > 0) {
 		/* flashpgs_per_blk depends on capacity */
 		spp->blks_per_pl = BLKS_PER_PLN;
+#if (IS_CONZONE)
+		NVMEV_ASSERT(BLK_SIZE > 0);
+		blk_size = BLK_SIZE;
+#else
 		blk_size = DIV_ROUND_UP(capacity,
 								spp->blks_per_pl * spp->pls_per_lun * spp->luns_per_ch * spp->nchs);
+#endif
 	} else {
 		NVMEV_ASSERT(BLK_SIZE > 0);
 		blk_size = BLK_SIZE;

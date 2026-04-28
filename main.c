@@ -523,14 +523,16 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	struct nvmev_ns *ns = kmalloc(sizeof(struct nvmev_ns) * nr_ns, GFP_KERNEL);
 
 	for (i = 0; i < nr_ns; i++) {
-#if IS_CONZONE_DUAL
-		size = nvmev_vdev->config.storage_size;
-#else
-		if (NS_CAPACITY(i) == 0)
+		if (NS_CAPACITY(i) == 0) {
 			size = remaining_capacity;
-		else
-			size = min(NS_CAPACITY(i), remaining_capacity);
-#endif
+		} else {
+			if (NS_CAPACITY(i) > remaining_capacity) {
+				NVMEV_ERROR("ns %d capacity %llu MiB exceeds remaining backing %llu MiB\n", i,
+							BYTE_TO_MB(NS_CAPACITY(i)), BYTE_TO_MB(remaining_capacity));
+				BUG_ON(1);
+			}
+			size = NS_CAPACITY(i);
+		}
 
 		if (NS_SSD_TYPE(i) == SSD_TYPE_NVM)
 			simple_init_namespace(&ns[i], i, size, ns_addr, disp_no);
@@ -551,11 +553,10 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 		else
 			BUG_ON(1);
 
-#if !IS_CONZONE_DUAL
 		remaining_capacity -= size;
-		ns_addr += size;
-#endif
-		NVMEV_INFO("ns %d/%d: size %lld MiB\n", i, nr_ns, BYTE_TO_MB(ns[i].size));
+		ns_addr = (char *)ns_addr + size;
+		NVMEV_INFO("ns %d/%d: size %lld MiB mapped %p\n", i, nr_ns,
+				   BYTE_TO_MB(ns[i].size), ns[i].mapped);
 	}
 
 #if (IS_CONZONE)
