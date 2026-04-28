@@ -42,8 +42,39 @@ ConZone-Dual 是一个运行在 Linux 内核中的 NVMe 虚拟设备（`nvmevirt
 #define PLNS_PER_LUN       4
 #define CELL_MODE          CELL_MODE_TLC       // 默认 TLC，SLC 行是 pSLC 模式
 
-// SLC 行数（每个 plane 中划给 SLC 的 block 行数）
+// Dual 几何和容量
 #define DUAL_SLC_INIT_BLKS 4
+#define DUAL_BLKS_PER_PLN  12
+#define DUAL_TLC_INIT_BLKS (DUAL_BLKS_PER_PLN - DUAL_SLC_INIT_BLKS)
+#define DUAL_SLC_CAPACITY  (...)
+#define DUAL_TLC_CAPACITY  (...)
+#define NS_CAPACITY_0      DUAL_SLC_CAPACITY
+#define NS_CAPACITY_1      DUAL_TLC_CAPACITY
+```
+
+当前默认配置下：
+
+```text
+BLK_SIZE      = 33 MiB
+pSLC_BLK_SIZE = BLK_SIZE / CELL_MODE = 11 MiB
+
+SLC namespace = 4 rows * 4 ch * 2 lun/ch * 4 plane/lun * 11 MiB
+              = 1408 MiB
+
+TLC namespace = 8 rows * 4 ch * 2 lun/ch * 4 plane/lun * 33 MiB
+              = 8448 MiB
+```
+
+`main.c` 会从 `memmap_start + 1MiB` 开始映射 payload backing，因此 `memmap_size` 至少要覆盖：
+
+```text
+1 MiB reserved + 1408 MiB + 8448 MiB = 9857 MiB
+```
+
+所以快速测试可使用：
+
+```bash
+sudo insmod ./nvmev.ko memmap_start=4G memmap_size=10G cpus=2,3
 ```
 
 ---
@@ -156,12 +187,23 @@ nvmev_io_worker()  ← 绑定在特定 CPU 上的内核线程
   │
   ├─ 按 nsecs_target 顺序扫描工作队列
   ├─ 如果 is_copied == false：执行数据 memcpy（__do_perform_io）
-  │      将数据从/到 nvmev_vdev->ns[nsid].mapped（模拟的 SSD 存储区）
+  │      仅对 read/write/zone append 执行 payload 拷贝
+  │      先检查 nsid、offset、length 是否落在 ns[nsid].size 内
+  │      将数据从/到 nvmev_vdev->ns[nsid].mapped + offset
   ├─ 如果 nsecs_target <= 当前时钟：
   │      ├─ 普通 I/O：填写完成队列条目（__fill_cq_result）并触发中断
   │      └─ 内部操作（写缓冲区释放）：buffer_release()
   └─ 触发 MSI/MSI-X 中断通知主机
 ```
+
+注意：DMA 路径也必须使用 namespace 的 backing 起点：
+
+```text
+nvmev_vdev->config.storage_start +
+    (ns[nsid].mapped - nvmev_vdev->storage_mapped) + offset
+```
+
+否则即使 `ns[0].mapped` 和 `ns[1].mapped` 已经分开，DMA 仍可能退回到 `storage_start + offset` 并造成两个 namespace 的 payload 数据重叠。
 
 ---
 
@@ -170,6 +212,8 @@ nvmev_io_worker()  ← 绑定在特定 CPU 上的内核线程
 ```
 struct nvmev_dev (nvmev_vdev)
   ├─ ns[0]  ← SLC 命名空间
+  │    ├─ mapped → storage_mapped + 0
+  │    ├─ size   → DUAL_SLC_CAPACITY
   │    └─ ftls → struct zms_ftl (SLC)
   │               ├─ ssd ──────────────────────────┐
   │               ├─ maptbl[]  (LPN→PPA 映射表)     │
@@ -183,6 +227,8 @@ struct nvmev_dev (nvmev_vdev)
   │               └─ write_buffer[]                  │
   │                                                  │  共享同一个
   ├─ ns[1]  ← TLC 命名空间                           │  struct ssd
+  │    ├─ mapped → storage_mapped + DUAL_SLC_CAPACITY
+  │    ├─ size   → DUAL_TLC_CAPACITY
   │    └─ ftls → struct zms_ftl (TLC)               │
   │               ├─ ssd ──────────────────────────▶│
   │               ├─ maptbl[]  (独立的 L2P 表)        │
@@ -200,11 +246,16 @@ struct nvmev_dev (nvmev_vdev)
                                           struct ssd
                                             ├─ ch[0..3]  (4 个 channel)
                                             │    └─ lun[0..1]  (每 ch 2 个 lun)
-                                            │         └─ blk[0..N]  (每 lun N 个 block)
-                                            │              ├─ blk[0..3]   → pSLC 块 (SLC 命名空间)
-                                            │              └─ blk[4..N-1] → TLC 块  (TLC 命名空间)
+                                            │         └─ blk[0..11] (当前每 lun 12 个 block)
+                                            │              ├─ blk[0..3]    → pSLC 块 (SLC 命名空间)
+                                            │              └─ blk[4..11]   → TLC 块  (TLC 命名空间)
                                             └─ l2pcache  (两个命名空间共享)
 ```
+
+这里有两层“存储”语义：
+
+- `struct ssd` 是共享的物理 NAND/timing/FTL 模型，决定 PPA 分配、介质延迟、通道/LUN 冲突。
+- `ns[i].mapped` 是 host-visible payload backing memory，用于 `io.c` 的数据拷贝和 verify。两个 namespace 必须指向不同 backing 区间，否则不同 namespace 的同 offset 写读可能互相串扰。
 
 ---
 
@@ -220,8 +271,9 @@ struct nvmev_dev (nvmev_vdev)
 | **Line 管理链表** | `pslc_free/victim/full_list` | `free/victim/full_list` | 空闲块、垃圾回收候选块、写满块的链表各自独立 |
 | **写信用** | `pslc_wfc` | `wfc` | 流控：写一页消耗一个信用，GC 完成后补充 |
 | **写缓冲区** | `write_buffer[]`（SLC）| `write_buffer[]`（TLC）| 各自缓冲区，ZONE_WB_SIZE = 1536 KiB |
-| **物理块行** | block row 0..3（pSLC 模式）| block row 4..N（TLC 模式）| 物理上哪些块属于谁，由 `pslc_blks` 划分 |
+| **物理块行** | block row 0..`DUAL_SLC_INIT_BLKS - 1`（pSLC 模式）| block row `DUAL_SLC_INIT_BLKS`..`DUAL_BLKS_PER_PLN - 1`（TLC 模式）| 物理上哪些块属于谁，由 `pslc_blks` 划分 |
 | **写入 oneshot 大小** | 1 flash page（16 KiB）| 3 flash pages（48 KiB）| TLC 需要凑满 3 页才能一次性编程 |
+| **Payload backing** | `storage_mapped + 0` | `storage_mapped + DUAL_SLC_CAPACITY` | 主机可见数据拷贝区独立，避免 fio/nvme-cli verify 串扰 |
 
 ---
 
@@ -237,6 +289,8 @@ struct nvmev_dev (nvmev_vdev)
 | **I/O Worker 线程** | `nvmev_vdev->io_workers[]` | 两个命名空间的 I/O 完成都由同一组 worker 线程处理 |
 | **中断机制** | `nvmev_signal_irq()` | 同一套 MSI/MSI-X 中断向量 |
 | **NAND 延迟参数** | `ssdparams` | SLC/TLC 各自的读写延迟数值存在同一个参数结构里，但 cell mode 决定使用哪套参数 |
+
+不共享的是 host payload backing memory。`main.c` 初始化 namespace 时按 `NS_CAPACITY(i)` 推进 `ns_addr`，`zms_realize_namespaces()` 只把 FTL 的 `storage_base_addr` 对齐到各自 `ns[i].mapped`，不再重新把两个 namespace 映射回同一段内存。
 
 **L2P 缓存共享的细节**（[zms_read_write.c:594-608](../zms_read_write.c#L594)）：
 
@@ -385,14 +439,107 @@ SLC 写比 TLC 写快约 **12.5 倍**，SLC 读比 TLC 读快约 **2 倍**。
 
 ---
 
-## 12. 源文件索引
+## 12. 正确性验证
+
+### 12.1 容量验证
+
+加载模块：
+
+```bash
+sudo insmod ./nvmev.ko memmap_start=4G memmap_size=10G cpus=2,3
+```
+
+当前测试环境可能只创建设备字符节点 `/dev/ng0n1`、`/dev/ng0n2`。容量可用 `nvme id-ns` 验证：
+
+```bash
+sudo nvme id-ns /dev/ng0n1
+sudo nvme id-ns /dev/ng0n2
+```
+
+预期：
+
+```text
+/dev/ng0n1 nsze = 0x2c0000   = 1408 MiB
+/dev/ng0n2 nsze = 0x1080000  = 8448 MiB
+```
+
+`nvme list` 使用十进制 GB 显示时约为：
+
+```text
+ng0n1: 1.48 GB
+ng0n2: 8.86 GB
+```
+
+### 12.2 Payload Backing 不串扰验证
+
+ZNS 写入必须按 zone write pointer 顺序写。下面测试先 reset zone 0，再在相同 LBA 写入不同 pattern，并读回比较：
+
+```bash
+cd /tmp
+
+python3 - <<'PY'
+from pathlib import Path
+Path("slc_a.bin").write_bytes(bytes([0x11]) * 4096)
+Path("tlc_b.bin").write_bytes(bytes([0x22]) * 4096)
+PY
+
+sudo nvme zns reset-zone /dev/ng0n1 --start-lba=0
+sudo nvme zns reset-zone /dev/ng0n2 --start-lba=0
+
+sudo nvme write /dev/ng0n1 --start-block=0 --block-count=7 --data-size=4096 --data=slc_a.bin
+sudo nvme write /dev/ng0n2 --start-block=0 --block-count=7 --data-size=4096 --data=tlc_b.bin
+
+sudo nvme read /dev/ng0n1 --start-block=0 --block-count=7 --data-size=4096 --data=slc_read.bin
+sudo nvme read /dev/ng0n2 --start-block=0 --block-count=7 --data-size=4096 --data=tlc_read.bin
+
+cmp -s slc_a.bin slc_read.bin && echo "SLC OK"
+cmp -s tlc_b.bin tlc_read.bin && echo "TLC OK"
+cmp -s slc_read.bin tlc_read.bin && echo "BAD: namespaces alias" || echo "OK: namespaces isolated"
+```
+
+继续在当前 write pointer（8）做非零 offset 测试：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+Path("slc_c.bin").write_bytes(bytes([0x33]) * 4096)
+Path("tlc_d.bin").write_bytes(bytes([0x44]) * 4096)
+PY
+
+sudo nvme write /dev/ng0n1 --start-block=8 --block-count=7 --data-size=4096 --data=slc_c.bin
+sudo nvme write /dev/ng0n2 --start-block=8 --block-count=7 --data-size=4096 --data=tlc_d.bin
+
+sudo nvme read /dev/ng0n1 --start-block=8 --block-count=7 --data-size=4096 --data=slc_read2.bin
+sudo nvme read /dev/ng0n2 --start-block=8 --block-count=7 --data-size=4096 --data=tlc_read2.bin
+
+cmp -s slc_c.bin slc_read2.bin && echo "SLC offset OK"
+cmp -s tlc_d.bin tlc_read2.bin && echo "TLC offset OK"
+cmp -s slc_read2.bin tlc_read2.bin && echo "BAD: offset aliases" || echo "OK: offset isolated"
+```
+
+预期输出：
+
+```text
+SLC OK
+TLC OK
+OK: namespaces isolated
+SLC offset OK
+TLC offset OK
+OK: offset isolated
+```
+
+如果跳过顺序写直接写 `--start-block=1024`，ZNS 会返回 `Zone Invalid Write`，这不是串扰证据，而是 write pointer 规则生效。
+
+---
+
+## 13. 源文件索引
 
 | 文件 | 主要内容 |
 |------|----------|
 | [ssd_config.h](../ssd_config.h) | 所有配置宏：命名空间类型、物理参数、延迟数值 |
 | [ssd.h](../ssd.h) | 核心数据结构：PPA、NAND 页/块/lun、ssdparams |
 | [zns_ftl.h](../zns_ftl.h) | FTL 数据结构：zms_ftl、zms_write_pointer、zms_line_mgmt |
-| [io.c](../io.c) | I/O 提交/完成处理、I/O Worker 线程 |
+| [io.c](../io.c) | I/O 提交/完成处理、I/O Worker 线程、namespace payload 范围检查和 backing 拷贝 |
 | [zns_ftl.c](../zns_ftl.c) | 命名空间初始化、参数计算、realize |
 | [zms_read_write.c](../zms_read_write.c) | 核心读写逻辑、L2P 缓存、GC、迁移 |
 | [ssd.c](../ssd.c) | 物理 NAND 模拟、延迟计算 |
