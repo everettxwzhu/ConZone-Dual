@@ -17,6 +17,8 @@ struct nvme_zns_lbaf {
 	__u8 resv[7];
 };
 
+#define NVME_ZNS_MAX_LBAF 64
+
 struct nvme_id_zns_ns {
 	__u16 zoc;	// zone operation characteristics
 	__u16 ozcs; // optional zoned command support
@@ -31,10 +33,10 @@ struct nvme_id_zns_ns {
 	__le16 zrwasz;	// zrwa size (lbas)
 	__u8 zrwacap;	// zrwa capability (bit 0: explicit zrwa flush)
 	__u8 rsv2[2763];
-	struct nvme_zns_lbaf lbaf[16];
-	__u8 rsv3[768];
+	struct nvme_zns_lbaf lbaf[NVME_ZNS_MAX_LBAF];
 	__u8 vs[256];
 };
+static_assert(sizeof(struct nvme_id_zns_ns) == 4096);
 
 enum {
 	NVME_SC_ZNS_INVALID_ZONE_OPERATION = ((NVME_SCT_CMD_SPECIFIC_STATUS << 8) | 0xB6),
@@ -116,7 +118,7 @@ struct zone_report {
 	__u64 rsvd[7];
 
 	// several zone descriptors..
-	struct zone_descriptor zd[1];
+	struct zone_descriptor zd[];
 };
 
 // zone management receive command

@@ -147,7 +147,7 @@ struct nand_plane {
 	struct nand_block *blk;
 	uint64_t next_pln_avail_time;
 	int nblks;
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	bool busy;
 	struct list_head cmd_queue_head;
 	uint64_t cmd_queue_depth;
@@ -271,7 +271,7 @@ struct ssdparams {
 	unsigned long long write_buffer_size;
 	unsigned long line_groups;
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 	uint64_t blksz; /* chunk mapping unit in bytes*/
 	uint64_t pslc_blksz;
 	uint64_t pslc_pgs_per_oneshotpg; /* # of pgs per oneshot pSLC page*/
@@ -360,7 +360,7 @@ uint64_t ssd_next_idle_time(struct ssd *ssd);
 
 void buffer_init(struct buffer *buf, size_t size);
 uint32_t buffer_allocate(struct buffer *buf, size_t size);
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 bool is_buffer_busy(struct buffer *buf);
 #endif
 bool buffer_release(struct buffer *buf, size_t size);

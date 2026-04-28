@@ -442,10 +442,21 @@ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct
 
 static inline bool is_zoned(int ns_type)
 {
-	return (ns_type == SSD_TYPE_CONZONE_ZONED);
+	return (ns_type == SSD_TYPE_ZNS || ns_type == SSD_TYPE_CONZONE_ZONED ||
+			ns_type == SSD_TYPE_CONZONE_SLC || ns_type == SSD_TYPE_CONZONE_TLC);
 }
 
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
+static inline bool zms_is_dual_ns(int ns_type)
+{
+	return (ns_type == SSD_TYPE_CONZONE_SLC || ns_type == SSD_TYPE_CONZONE_TLC);
+}
+
+static inline int zms_dual_target_loc(int ns_type)
+{
+	return ns_type == SSD_TYPE_CONZONE_SLC ? LOC_PSLC : LOC_NORMAL;
+}
+
 static inline int get_namespace_type(int ns_type)
 {
 	switch (ns_type) {
@@ -453,6 +464,8 @@ static inline int get_namespace_type(int ns_type)
 		return META_NAMESPACE;
 	case SSD_TYPE_CONZONE_ZONED:
 	case SSD_TYPE_CONZONE_BLOCK:
+	case SSD_TYPE_CONZONE_SLC:
+	case SSD_TYPE_CONZONE_TLC:
 		return DATA_NAMESPACE;
 	default:
 		NVMEV_ERROR("undefined namespace type? %d\n", ns_type);

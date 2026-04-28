@@ -10,7 +10,8 @@
 #include "dma.h"
 
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED) || \
-	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META))
+	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META) ||                    \
+	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 #include "ssd.h"
 #else
 struct buffer;
@@ -48,20 +49,61 @@ static inline size_t __cmd_io_size(struct nvme_rw_command *cmd)
 	return (cmd->length + 1) << LBA_BITS;
 }
 
+static inline bool __cmd_has_storage_payload(struct nvme_rw_command *cmd)
+{
+	return cmd->opcode == nvme_cmd_write || cmd->opcode == nvme_cmd_zone_append ||
+		   cmd->opcode == nvme_cmd_read;
+}
+
+static bool __cmd_ns_range(struct nvme_rw_command *cmd, size_t *nsid, size_t *offset,
+						   size_t *length)
+{
+	struct nvmev_ns *ns;
+
+	if (!cmd->nsid || cmd->nsid > nvmev_vdev->nr_ns) {
+		NVMEV_ERROR("invalid nsid %u\n", cmd->nsid);
+		return false;
+	}
+
+	*nsid = cmd->nsid - 1;
+	*offset = __cmd_io_offset(cmd);
+	*length = __cmd_io_size(cmd);
+	ns = &nvmev_vdev->ns[*nsid];
+
+	if (*offset > ns->size || *length > ns->size - *offset) {
+		NVMEV_ERROR("ns %zu io out of range offset %zu len %zu size %llu\n", *nsid, *offset,
+					*length, ns->size);
+		return false;
+	}
+
+	return true;
+}
+
+static inline unsigned long __ns_storage_start(struct nvmev_ns *ns)
+{
+	return nvmev_vdev->config.storage_start +
+		   ((char *)ns->mapped - (char *)nvmev_vdev->storage_mapped);
+}
+
 static unsigned int __do_perform_io(int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvme_rw_command *cmd = &sq_entry(sq_entry).rw;
+	struct nvmev_ns *ns;
 	size_t offset;
 	size_t length, remaining;
 	int prp_offs = 0;
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
-	size_t nsid = cmd->nsid - 1; // 0-based
+	size_t nsid;
 
-	offset = __cmd_io_offset(cmd);
-	length = __cmd_io_size(cmd);
+	if (!__cmd_has_storage_payload(cmd))
+		return __cmd_io_size(cmd);
+
+	if (!__cmd_ns_range(cmd, &nsid, &offset, &length))
+		return 0;
+	ns = &nvmev_vdev->ns[nsid];
 	remaining = length;
 
 	while (remaining) {
@@ -93,9 +135,9 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		}
 
 		if (cmd->opcode == nvme_cmd_write || cmd->opcode == nvme_cmd_zone_append) {
-			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr + mem_offs, io_size);
+			memcpy((char *)ns->mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			memcpy(vaddr + mem_offs, nvmev_vdev->ns[nsid].mapped + offset, io_size);
+			memcpy(vaddr + mem_offs, (char *)ns->mapped + offset, io_size);
 		}
 
 		kunmap_atomic(vaddr);
@@ -117,8 +159,10 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvme_rw_command *cmd = &sq_entry(sq_entry).rw;
+	struct nvmev_ns *ns;
 	size_t offset;
 	size_t length, remaining;
+	size_t nsid;
 	int prp_offs = 0;
 	int prp2_offs = 0;
 	int num_prps = 0;
@@ -126,9 +170,15 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	u64 *tmp_paddr_list = NULL;
 	size_t io_size;
 	size_t mem_offs = 0;
+	unsigned long ns_storage_start;
 
-	offset = __cmd_io_offset(cmd);
-	length = __cmd_io_size(cmd);
+	if (!__cmd_has_storage_payload(cmd))
+		return __cmd_io_size(cmd);
+
+	if (!__cmd_ns_range(cmd, &nsid, &offset, &length))
+		return 0;
+	ns = &nvmev_vdev->ns[nsid];
+	ns_storage_start = __ns_storage_start(ns);
 	remaining = length;
 
 	memset(paddr_list, 0, sizeof(paddr_list));
@@ -197,9 +247,9 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 		io_size = min_t(size_t, remaining, page_size);
 
 		if (cmd->opcode == nvme_cmd_write || cmd->opcode == nvme_cmd_zone_append) {
-			ioat_dma_submit(paddr, nvmev_vdev->config.storage_start + offset, io_size);
+			ioat_dma_submit(paddr, ns_storage_start + offset, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			ioat_dma_submit(nvmev_vdev->config.storage_start + offset, paddr, io_size);
+			ioat_dma_submit(ns_storage_start + offset, paddr, io_size);
 		}
 
 		remaining -= io_size;
@@ -605,8 +655,11 @@ static int nvmev_io_worker(void *data)
 #endif
 				if (w->is_internal) {
 					;
+				} else if (w->status != NVME_SC_SUCCESS) {
+					;
 				} else if (io_using_dma) {
-					__do_perform_io_using_dma(w->sqid, w->sq_entry);
+					if (!__do_perform_io_using_dma(w->sqid, w->sq_entry))
+						w->status = NVME_SC_LBA_RANGE;
 				} else {
 #if (BASE_SSD == KV_PROTOTYPE)
 					struct nvmev_submission_queue *sq = nvmev_vdev->sqes[w->sqid];
@@ -614,10 +667,12 @@ static int nvmev_io_worker(void *data)
 					if (ns->identify_io_cmd(ns, sq_entry(w->sq_entry))) {
 						w->result0 = ns->perform_io_cmd(ns, &sq_entry(w->sq_entry), &(w->status));
 					} else {
-						__do_perform_io(w->sqid, w->sq_entry);
+						if (!__do_perform_io(w->sqid, w->sq_entry))
+							w->status = NVME_SC_LBA_RANGE;
 					}
 #else
-					__do_perform_io(w->sqid, w->sq_entry);
+					if (!__do_perform_io(w->sqid, w->sq_entry))
+						w->status = NVME_SC_LBA_RANGE;
 #endif
 				}
 
@@ -634,7 +689,8 @@ static int nvmev_io_worker(void *data)
 			if (w->nsecs_target <= curr_nsecs) {
 				if (w->is_internal) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS) || SUPPORTED_SSD_TYPE(CONZONE_ZONED) || \
-	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META))
+	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META) ||                    \
+	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 					buffer_release((struct buffer *)w->write_buffer, w->buffs_to_release);
 #endif
 				} else {

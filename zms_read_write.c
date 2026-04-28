@@ -10,7 +10,7 @@
 #include "nvmev.h"
 #include "ssd.h"
 #include "zns_ftl.h"
-#if (BASE_SSD == CONZONE_PROTOTYPE)
+#if (IS_CONZONE)
 static inline bool check_resident(struct zms_ftl *zms_ftl, int gran)
 {
 	if (is_zoned(zms_ftl->zp.ns_type) && L2P_HYBRID_MAP_RESIDENT)
@@ -31,6 +31,17 @@ static inline bool mapped_ppa(struct ppa *ppa) { return !(ppa->ppa == UNMAPPED_P
 static inline bool valid_lpn(struct zms_ftl *zms_ftl, uint64_t lpn)
 {
 	return (lpn < zms_ftl->zp.tt_lpns);
+}
+
+static int zms_first_owned_blk(struct zms_ftl *zms_ftl)
+{
+	struct ssdparams *spp = &zms_ftl->ssd->sp;
+
+	if (zms_is_dual_ns(zms_ftl->zp.ns_type))
+		return zms_dual_target_loc(zms_ftl->zp.ns_type) == LOC_PSLC ? 0 : spp->pslc_blks;
+	if (get_namespace_type(zms_ftl->zp.ns_type) == META_NAMESPACE)
+		return 0;
+	return spp->meta_pslc_blks + spp->meta_normal_blks;
 }
 
 static int get_page_location(struct zms_ftl *zms_ftl, struct ppa *ppa)
@@ -103,11 +114,7 @@ static struct zms_line *get_line(struct zms_ftl *zms_ftl, struct ppa *ppa)
 
 	/* 1. Physical Row Index */
 	int row_idx;
-	if (get_namespace_type(zms_ftl->zp.ns_type) == META_NAMESPACE) {
-		row_idx = ppa->zms.blk;
-	} else {
-		row_idx = ppa->zms.blk - (spp->meta_pslc_blks + spp->meta_normal_blks);
-	}
+	row_idx = ppa->zms.blk - zms_first_owned_blk(zms_ftl);
 
 	/* 2. Calculate Group ID */
 	int global_die_idx = ppa->zms.lun * spp->nchs + ppa->zms.ch;
@@ -146,19 +153,22 @@ static uint64_t ppa_2_pgidx(struct zms_ftl *zms_ftl, struct ppa *ppa)
 	struct zms_line *line = get_line(zms_ftl, ppa);
 	uint64_t lineid = (line->parent_id == -1) ? line->id : line->parent_id;
 	uint64_t pgidx;
+	int location = get_page_location(zms_ftl, ppa);
+	uint64_t pgs_per_oneshotpg =
+		location == LOC_PSLC ? spp->pslc_pgs_per_oneshotpg : spp->pgs_per_oneshotpg;
 
 	// Mapped as interleave, but does not represent the actual address iterations
 
 	pgidx = lineid * line->pgs_per_line;
-	pgidx += (ppa->zms.pg / spp->pgs_per_oneshotpg) *
-			 (spp->pgs_per_oneshotpg * spp->nchs * spp->luns_per_ch * spp->pls_per_lun);
+	pgidx += (ppa->zms.pg / pgs_per_oneshotpg) *
+			 (pgs_per_oneshotpg * spp->nchs * spp->luns_per_ch * spp->pls_per_lun);
 
 	uint64_t parallel_idx = ppa->zms.lun * (spp->nchs * spp->pls_per_lun) +
 							ppa->zms.ch * spp->pls_per_lun + ppa->zms.pl;
-	pgidx += parallel_idx * spp->pgs_per_oneshotpg;
+	pgidx += parallel_idx * pgs_per_oneshotpg;
 
 	// pg offset
-	pgidx += ppa->zms.pg % spp->pgs_per_oneshotpg;
+	pgidx += ppa->zms.pg % pgs_per_oneshotpg;
 	return pgidx;
 }
 
@@ -389,11 +399,7 @@ int lmid_2_blkid(struct zms_ftl *zms_ftl, struct zms_line *line)
 	// Line 0 --> Block 0 (row #0)
 	// Line 1 --> Block 0 (row #1)
 	// Line 2 --> Block 1 (row #0)
-	if (get_namespace_type(zms_ftl->zp.ns_type) == META_NAMESPACE) {
-		blkid = lmblk / spp->line_groups;
-	} else {
-		blkid = lmblk / spp->line_groups + spp->meta_normal_blks + spp->meta_pslc_blks;
-	}
+	blkid = lmblk / spp->line_groups + zms_first_owned_blk(zms_ftl);
 	return blkid;
 }
 
@@ -784,9 +790,7 @@ static uint64_t check_maxfreetime(struct zms_ftl *zms_ftl)
 
 static int get_aggidx(struct zms_ftl *zms_ftl, uint64_t lpn)
 {
-	return zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_ZONED
-			   ? lpn_to_zone((struct zns_ftl *)(&(*zms_ftl)), lpn)
-			   : 0;
+	return is_zoned(zms_ftl->zp.ns_type) ? lpn_to_zone((struct zns_ftl *)(&(*zms_ftl)), lpn) : 0;
 }
 
 struct ppa get_current_page(struct zms_ftl *zms_ftl, struct zms_write_pointer *wp)
@@ -1509,7 +1513,7 @@ static int update_mapping_if_reserved(struct zms_ftl *zms_ftl, uint64_t lpn, int
 	if (io_type == USER_IO && get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
 		(current_line->rpc == 0 &&
 		 current_line->vpc + current_line->ipc == current_line->pgs_per_line)) {
-		if (loc == LOC_PSLC) {
+		if (loc == LOC_PSLC && !zms_is_dual_ns(zms_ftl->zp.ns_type)) {
 			zms_ftl->line_write_cnt++;
 			current_line->mid.write_order = zms_ftl->line_write_cnt;
 			pqueue_insert(zms_ftl->migrating_line_pq, &current_line->mid);
@@ -1587,7 +1591,7 @@ static void update_or_reserve_mapping(struct zms_ftl *zms_ftl, uint64_t lpn, int
 			get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
 			(current_line->rpc == 0 &&
 			 current_line->vpc + current_line->ipc == current_line->pgs_per_line)) {
-			if (loc == LOC_PSLC) {
+			if (loc == LOC_PSLC && !zms_is_dual_ns(zms_ftl->zp.ns_type)) {
 				zms_ftl->line_write_cnt++;
 				current_line->mid.write_order = zms_ftl->line_write_cnt;
 				pqueue_insert(zms_ftl->migrating_line_pq, &current_line->mid);
@@ -1742,7 +1746,8 @@ static uint64_t nand_write(struct zms_ftl *zms_ftl, uint64_t nsecs_start, uint64
 
 	if (io_type != GC_IO) {
 		if (zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_META ||
-			(zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_BLOCK && location == LOC_NORMAL)) {
+			(zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_BLOCK && location == LOC_NORMAL) ||
+			(zms_ftl->zp.ns_type == SSD_TYPE_CONZONE_TLC && location == LOC_NORMAL)) {
 			consume_write_credit(zms_ftl, location);
 			check_and_refill_write_credit(zms_ftl, location);
 		}
@@ -2314,6 +2319,9 @@ static struct zms_line *do_migrate_simple(struct zms_ftl *zms_ftl, int io_type)
 
 static void try_migrate(struct zms_ftl *zms_ftl)
 {
+	if (zms_is_dual_ns(zms_ftl->zp.ns_type))
+		return;
+
 	if (!SLC_BYPASS && should_migrate_low(zms_ftl)) {
 		struct ppa ppa;
 		struct zms_line *sblk_line = NULL;
@@ -2618,6 +2626,8 @@ static int get_flush_target_location(struct zms_ftl *zms_ftl, struct buffer *wri
 									 int written_pgs)
 {
 	int loc = LOC_PSLC;
+	if (zms_is_dual_ns(zms_ftl->zp.ns_type))
+		return zms_dual_target_loc(zms_ftl->zp.ns_type);
 	if (get_namespace_type(zms_ftl->zp.ns_type) == META_NAMESPACE)
 		loc = LOC_PSLC;
 	else if (!SLC_BYPASS)
@@ -2774,7 +2784,8 @@ uint64_t buffer_flush(struct zms_ftl *zms_ftl, struct buffer *write_buffer, uint
 					}
 					zms_ftl->inplace_update++;
 				}
-				if (SLC_BYPASS && get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
+				if (SLC_BYPASS && !zms_is_dual_ns(zms_ftl->zp.ns_type) &&
+					get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
 					loc == LOC_PSLC) {
 					zms_ftl->zone_agg_lpns[agg_idx][agg_len] = lpn;
 					agg_len++;
@@ -2787,7 +2798,8 @@ uint64_t buffer_flush(struct zms_ftl *zms_ftl, struct buffer *write_buffer, uint
 				}
 				nsecs_latest = max(nsecs_latest, complete_time);
 			}
-			if (SLC_BYPASS && get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
+			if (SLC_BYPASS && !zms_is_dual_ns(zms_ftl->zp.ns_type) &&
+				get_namespace_type(zms_ftl->zp.ns_type) != META_NAMESPACE &&
 				(loc == LOC_PSLC)) {
 				zms_ftl->zone_agg_pgs[agg_idx] = agg_len;
 			}

@@ -10,6 +10,10 @@
 #define KV_PROTOTYPE 3
 #define WD_ZN540 4
 #define CONZONE_PROTOTYPE 5
+#define CONZONE_DUAL_PROTOTYPE 6
+
+#define IS_CONZONE (BASE_SSD == CONZONE_PROTOTYPE || BASE_SSD == CONZONE_DUAL_PROTOTYPE)
+#define IS_CONZONE_DUAL (BASE_SSD == CONZONE_DUAL_PROTOTYPE)
 
 /* SSD Type */
 #define SSD_TYPE_NVM 0
@@ -19,7 +23,9 @@
 #define SSD_TYPE_CONZONE_ZONED 4
 #define SSD_TYPE_CONZONE_META 5
 #define SSD_TYPE_CONZONE_BLOCK 6
-#define SSD_TYPE_NONE 7
+#define SSD_TYPE_CONZONE_SLC 7
+#define SSD_TYPE_CONZONE_TLC 8
+#define SSD_TYPE_NONE 9
 
 /* Cell Mode */
 #define CELL_MODE_UNKNOWN 0
@@ -257,7 +263,7 @@ static_assert((ZONE_SIZE % DIES_PER_ZONE) == 0);
 #define LBA_SIZE (1 << LBA_BITS)
 
 // HN8T274EJKX130 Zoned UFS
-#elif (BASE_SSD == CONZONE_PROTOTYPE)
+#elif IS_CONZONE
 #define NR_NAMESPACES (2ULL)
 
 static_assert(NR_NAMESPACES <= 2);
@@ -266,10 +272,17 @@ static_assert(NR_NAMESPACES <= 2);
 //  32GiB ZONED: MB(4096ULL) BLOCK: MB(224ULL)
 #define LOGICAL_META_SIZE GB(2ULL)
 
+#if IS_CONZONE_DUAL
+#define NS_SSD_TYPE_0 SSD_TYPE_CONZONE_SLC
+#define NS_CAPACITY_0 (DUAL_SLC_CAPACITY)
+#define NS_SSD_TYPE_1 SSD_TYPE_CONZONE_TLC
+#define NS_CAPACITY_1 (DUAL_TLC_CAPACITY)
+#else
 #define NS_SSD_TYPE_0 SSD_TYPE_CONZONE_META
 #define NS_CAPACITY_0 (PHYSICAL_META_SIZE)
 #define NS_SSD_TYPE_1 SSD_TYPE_CONZONE_ZONED
 #define NS_CAPACITY_1 (0ULL)
+#endif
 #define MDTS (6)
 // The maximum queue depth for consumer-grade devices is typically 32 (or 64) (MQES+1)
 #define MQES (63)
@@ -289,13 +302,19 @@ static_assert(!(NORMAL_ONLY && !SLC_BYPASS));
 #define NAND_CHANNELS (4)
 #define LUNS_PER_NAND_CH (2)
 #define PLNS_PER_LUN (4)
+#define DUAL_SLC_INIT_BLKS (4)
+#define DUAL_BLKS_PER_PLN (12)
 
 #define PG_SIZE KB(4ULL)
 #define FLASH_PAGE_SIZE KB(16) // 16KiB * 4 plane
 #define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * (CELL_MODE))
 static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 
-#define BLKS_PER_PLN 0				  /* BLK_SIZE should not be 0 */
+#if IS_CONZONE_DUAL
+#define BLKS_PER_PLN (DUAL_BLKS_PER_PLN)
+#else
+#define BLKS_PER_PLN 0 /* BLK_SIZE should not be 0 */
+#endif
 #define BLK_SIZE MB(33ULL)			  // TLC ~ MB(66ULL) / MB(24ULL), QLC ~ MB(32ULL)
 static_assert(BLK_SIZE || BLKS_PER_PLN);
 static_assert(((BLK_SIZE * PLNS_PER_LUN) % ONESHOT_PAGE_SIZE) == 0);
@@ -418,6 +437,18 @@ static_assert(((pSLC_BLK_SIZE * PLNS_PER_LUN) % pSLC_ONESHOT_PAGE_SIZE) == 0);
 // static_assert(DATA_pSLC_INIT_BLKS >= 4);
 #define pSLC_INIT_BLKS \
 	(META_pSLC_INIT_BLKS + (DATA_pSLC_INIT_BLKS)) // pSLC area size, unit: # of sblks
+
+/* Dual prototype: split host-visible payload space by SLC/TLC media rows. */
+static_assert(DUAL_SLC_INIT_BLKS >= 4); // for gc
+static_assert(DUAL_BLKS_PER_PLN > DUAL_SLC_INIT_BLKS);
+#define DUAL_TLC_INIT_BLKS (DUAL_BLKS_PER_PLN - DUAL_SLC_INIT_BLKS)
+#define DUAL_SLC_CAPACITY                                                                  \
+	((uint64_t)DUAL_SLC_INIT_BLKS * NAND_CHANNELS * LUNS_PER_NAND_CH * PLNS_PER_LUN * \
+	 pSLC_BLK_SIZE)
+#define DUAL_TLC_CAPACITY                                                                 \
+	((uint64_t)DUAL_TLC_INIT_BLKS * NAND_CHANNELS * LUNS_PER_NAND_CH * PLNS_PER_LUN * \
+	 BLK_SIZE)
+#define DUAL_TOTAL_CAPACITY (DUAL_SLC_CAPACITY + DUAL_TLC_CAPACITY)
 
 #define MAX_ZRWA_ZONES (0)
 #define ZRWAFG_SIZE (0)
