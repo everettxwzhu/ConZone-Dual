@@ -810,7 +810,9 @@ static void zms_realize_dual_params(struct zms_ftl *zms_ftl)
 	uint64_t media_rows;
 	uint64_t media_pgs_per_line;
 	uint64_t media_bytes;
+	uint64_t logical_bytes;
 	uint64_t zone_capacity;
+	uint64_t zone_size;
 
 	if (location == LOC_PSLC) {
 		media_rows = spp->pslc_blks;
@@ -826,15 +828,17 @@ static void zms_realize_dual_params(struct zms_ftl *zms_ftl)
 	zpp->pslc_pgs_per_line = spp->pslc_pgs_per_line;
 
 	zone_capacity = media_pgs_per_line * spp->pgsz;
+	zone_size = location == LOC_PSLC ? DUAL_SLC_ZONE_SIZE : DUAL_TLC_ZONE_SIZE;
 	zpp->zone_capacity = zone_capacity;
-	zpp->zone_size = zone_capacity;
+	zpp->zone_size = zone_size;
 	zpp->pgs_per_zone = zone_capacity / PG_SIZE;
 
 	media_bytes = zpp->tt_lines * media_pgs_per_line * spp->pgsz;
+	logical_bytes = zpp->tt_lines * zone_size;
 	zpp->physical_size = media_bytes;
-	zpp->logical_size = media_bytes;
+	zpp->logical_size = logical_bytes;
 	if (zpp->ns && zpp->ns->size != zpp->logical_size) {
-		NVMEV_ERROR("dual namespace %d configured size %llu MiB differs from media size %llu MiB\n",
+		NVMEV_ERROR("dual namespace %d configured size %llu MiB differs from logical size %llu MiB\n",
 					zpp->ns->id, BYTE_TO_MB(zpp->ns->size), BYTE_TO_MB(zpp->logical_size));
 		BUG_ON(1);
 	}
