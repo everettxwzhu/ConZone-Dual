@@ -24,6 +24,16 @@ def run_cmd(cmd, *, check=True):
     return proc.returncode
 
 
+def result_ok(path, media, case, run, bs, iodepth, rw):
+    try:
+        row = extract_result(path, media, case, run, bs, iodepth, rw)
+    except (OSError, json.JSONDecodeError, KeyError, IndexError):
+        return None
+    if row["error"] == 0 and row["io_bytes"] > 0:
+        return row
+    return None
+
+
 def parse_list(value, cast=str):
     return [cast(x.strip()) for x in value.split(",") if x.strip()]
 
@@ -34,6 +44,11 @@ def reset_zone(args, dev, slba):
 
 def prefill(args, dev, label):
     prefix = sudo_prefix(args)
+    out_path = Path(args.out_dir) / f"prefill_{label}.json"
+    if args.resume and result_ok(out_path, label, f"prefill_{label}", 0, args.prefill_bs, 1, "write"):
+        print(f"prefill_{label}: reusing {out_path}")
+        return
+
     if args.reset:
         reset_zone(args, dev, args.start_lba)
 
@@ -48,9 +63,9 @@ def prefill(args, dev, label):
         "--iodepth=1",
         "--numjobs=1",
         f"--offset={args.offset}",
-        f"--size={args.size}",
+        f"--size={args.prefill_size}",
         "--output-format=json",
-        f"--output={args.out_dir}/prefill_{label}.json",
+        f"--output={out_path}",
     ]
     if args.cpus_allowed:
         cmd.append(f"--cpus_allowed={args.cpus_allowed}")
@@ -62,6 +77,7 @@ def is_write_workload(rw):
 
 
 def fio_cmd(args, case, dev, bs, iodepth, rw, out_path):
+    size = args.write_size if is_write_workload(rw) else args.size
     cmd = sudo_prefix(args) + [
         "fio",
         f"--name={case}",
@@ -73,7 +89,7 @@ def fio_cmd(args, case, dev, bs, iodepth, rw, out_path):
         f"--iodepth={iodepth}",
         "--numjobs=1",
         f"--offset={args.offset}",
-        f"--size={args.size}",
+        f"--size={size}",
         "--percentile_list=50:90:99:99.9",
         "--output-format=json",
         f"--output={out_path}",
@@ -151,6 +167,16 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def write_outputs(out_dir, rows):
+    csv_path = out_dir / "results.csv"
+    summary_path = out_dir / "summary.json"
+    write_csv(csv_path, rows)
+    summary = summarize(rows)
+    with open(summary_path, "w") as f:
+        json.dump({"rows": rows, "summary": summary}, f, indent=2)
+    return csv_path, summary_path, summary
+
+
 def summarize(rows):
     summary = []
     keys = sorted({(r["rw"], r["bs"], r["iodepth"]) for r in rows})
@@ -204,10 +230,26 @@ def main():
     parser.add_argument("--slc-dev", default="/dev/nvme0n1")
     parser.add_argument("--tlc-dev", default="/dev/nvme0n2")
     parser.add_argument("--size", default="128M")
+    parser.add_argument(
+        "--write-size",
+        default="8M",
+        help=(
+            "Per-case size for ordinary write tests. The current ConZone-Dual "
+            "small-write path can exhaust SLC lines after repeated write-buffer flushes."
+        ),
+    )
     parser.add_argument("--offset", default="0")
     parser.add_argument("--start-lba", default="0")
     parser.add_argument("--bs-list", default="4k,16k,128k,1m")
     parser.add_argument("--iodepth-list", default="1,4,32")
+    parser.add_argument(
+        "--write-iodepth-list",
+        default="1",
+        help=(
+            "Comma-separated iodepth values for ordinary ZNS writes. Keep this at 1 "
+            "unless the workload uses independent zones or zone append."
+        ),
+    )
     parser.add_argument(
         "--rw-list",
         default="read,randread,write",
@@ -226,7 +268,22 @@ def main():
         action="store_true",
         help="Do not reset the target zone before each sequential write test.",
     )
-    parser.add_argument("--prefill-bs", default="4M")
+    parser.add_argument("--prefill-bs", default="1M")
+    parser.add_argument(
+        "--prefill-size",
+        default="8M",
+        help="Amount of data written by --prepare before read tests.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse existing successful fio JSON files and skip those cases.",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Continue after a failed fio case and still write partial summaries.",
+    )
     parser.add_argument("--no-sudo", action="store_true")
     args = parser.parse_args()
 
@@ -236,6 +293,7 @@ def main():
 
     bs_list = parse_list(args.bs_list)
     iodepth_list = parse_list(args.iodepth_list, int)
+    write_iodepth_list = parse_list(args.write_iodepth_list, int)
     rw_list = parse_list(args.rw_list)
     unsupported = [rw for rw in rw_list if rw not in ("read", "randread", "write")]
     if unsupported:
@@ -254,13 +312,26 @@ def main():
     for run in range(1, args.runs + 1):
         for rw in rw_list:
             for bs in bs_list:
-                for iodepth in iodepth_list:
+                depths = write_iodepth_list if is_write_workload(rw) else iodepth_list
+                for iodepth in depths:
                     for media, dev in devices:
                         case = f"{media}_{rw}_bs{bs}_qd{iodepth}_run{run:02d}"
                         out_path = out_dir / f"{case}.json"
+                        if args.resume:
+                            result = result_ok(out_path, media, case, run, bs, iodepth, rw)
+                            if result:
+                                rows.append(result)
+                                print(f"{case}: reusing {out_path}")
+                                continue
                         if is_write_workload(rw) and not args.no_write_reset:
                             reset_zone(args, dev, args.start_lba)
-                        run_cmd(fio_cmd(args, case, dev, bs, iodepth, rw, out_path))
+                        try:
+                            run_cmd(fio_cmd(args, case, dev, bs, iodepth, rw, out_path))
+                        except subprocess.CalledProcessError:
+                            if not args.keep_going:
+                                raise
+                            print(f"{case}: failed, continuing")
+                            continue
                         result = extract_result(out_path, media, case, run, bs, iodepth, rw)
                         rows.append(result)
                         print(
@@ -269,12 +340,7 @@ def main():
                         )
                         time.sleep(0.2)
 
-    csv_path = out_dir / "results.csv"
-    summary_path = out_dir / "summary.json"
-    write_csv(csv_path, rows)
-    summary = summarize(rows)
-    with open(summary_path, "w") as f:
-        json.dump({"rows": rows, "summary": summary}, f, indent=2)
+    csv_path, summary_path, summary = write_outputs(out_dir, rows)
 
     print_summary(summary)
     print(f"\nWrote {csv_path}")

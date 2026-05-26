@@ -3767,6 +3767,10 @@ void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid)
 	}
 
 	zms_ftl->zone_agg_pgs[zid] = 0;
+	if (pslc_invalid || normal_invalid || bufs_to_release) {
+		zms_ftl->pslc_full = 0;
+		zms_ftl->device_full = 0;
+	}
 	zms_ftl->zone_reset_cnt++;
 	NVMEV_CONZONE_GC_DEBUG("ns %d Zone %lld (%lld-%lld) vs [%lld-%lld] Reset. pSLC lines: "
 						   "%d/%d/%d/%d, normal lines %d/%d/%d/%d "
