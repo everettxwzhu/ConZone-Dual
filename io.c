@@ -13,6 +13,7 @@
 	 SUPPORTED_SSD_TYPE(CONZONE_BLOCK) || SUPPORTED_SSD_TYPE(CONZONE_META) ||                    \
 	 SUPPORTED_SSD_TYPE(CONZONE_SLC) || SUPPORTED_SSD_TYPE(CONZONE_TLC))
 #include "ssd.h"
+#include "zns_ftl.h"
 #else
 struct buffer;
 #endif
@@ -87,6 +88,26 @@ static bool __cmd_ns_range(struct nvme_rw_command *cmd, size_t *nsid, size_t *of
 	return true;
 }
 
+static bool __zone_append_storage_offset(struct nvme_rw_command *cmd, struct nvmev_ns *ns,
+					 size_t *offset)
+{
+	struct zns_ftl *zns_ftl;
+	uint32_t zid;
+
+	if (cmd->opcode != nvme_cmd_zone_append)
+		return true;
+	if (ns->csi != NVME_CSI_ZNS || !ns->ftls)
+		return false;
+
+	zns_ftl = (struct zns_ftl *)ns->ftls;
+	zid = lba_to_zone(zns_ftl, cmd->slba);
+	if (zid >= zns_ftl->zp.nr_zones)
+		return false;
+
+	*offset = zns_ftl->zone_descs[zid].wp << LBA_BITS;
+	return true;
+}
+
 static inline unsigned long __ns_storage_start(struct nvmev_ns *ns)
 {
 	return nvmev_vdev->config.storage_start +
@@ -112,6 +133,8 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 	if (!__cmd_ns_range(cmd, &nsid, &offset, &length))
 		return 0;
 	ns = &nvmev_vdev->ns[nsid];
+	if (!__zone_append_storage_offset(cmd, ns, &offset))
+		return 0;
 	remaining = length;
 
 	while (remaining) {
@@ -186,6 +209,8 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	if (!__cmd_ns_range(cmd, &nsid, &offset, &length))
 		return 0;
 	ns = &nvmev_vdev->ns[nsid];
+	if (!__zone_append_storage_offset(cmd, ns, &offset))
+		return 0;
 	ns_storage_start = __ns_storage_start(ns);
 	remaining = length;
 

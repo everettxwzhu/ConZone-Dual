@@ -26,8 +26,14 @@
 #define CZ_ZSA_FINISH 0x02
 #define CZ_ZSA_OPEN 0x03
 #define CZ_ZSA_RESET 0x04
+#define CZ_ZSA_SELECT_ALL (1U << 8)
 
-#define CZ_MAX_CMD_LBAS 65536U
+/*
+ * The current simulator reports MDTS=6, so one passthrough I/O command must not
+ * exceed 4KiB * 2^6 = 256KiB. The block layer may split large fio requests, but
+ * NVME_IOCTL_IO64_CMD passthrough does not.
+ */
+#define CZ_MAX_CMD_LBAS 512U
 #define CZ_DEFAULT_COPY_CHUNK (4U * 1024U * 1024U)
 
 struct cz_nvme_zone_desc {
@@ -490,6 +496,42 @@ int cz_reset_zone(cz_handle_t *h, cz_media_t media, uint64_t zid)
 	return cz_zone_mgmt(h, media, zid, CZ_ZSA_RESET);
 }
 
+int cz_reset_all_zones(cz_handle_t *h, cz_media_t media)
+{
+	struct cz_device *dev = cz_dev(h, media);
+	struct nvme_passthru_cmd64 cmd;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+	ret = cz_report_zones_refresh(h, media);
+	if (ret)
+		return ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = CZ_OPC_ZONE_MGMT_SEND;
+	cmd.nsid = dev->nsid;
+	cmd.cdw13 = CZ_ZSA_RESET | CZ_ZSA_SELECT_ALL;
+	ret = cz_passthru64(dev->fd, &cmd);
+	if (ret)
+		return ret;
+
+	for (size_t i = 0; i < h->meta_len; i++) {
+		cz_extent_t *ext = &h->meta[i].ext;
+		if (h->meta[i].valid && ext->media == media) {
+			h->stats.invalidated_lbas += ext->nlb;
+			h->meta[i].valid = false;
+		}
+	}
+	for (size_t i = 0; i < dev->nr_zones; i++) {
+		dev->live_lbas[i] = 0;
+		h->stats.zone_reset_count[media]++;
+		(void)cz_meta_journal(h, "R %u %" PRIu64 "\n", media, (uint64_t)i);
+	}
+
+	return cz_report_zones_refresh(h, media);
+}
+
 static int cz_choose_zone(struct cz_device *dev, uint64_t zid_hint, uint64_t nlb,
 			  uint64_t *zid)
 {
@@ -554,19 +596,26 @@ static int cz_append_raw(cz_handle_t *h, cz_media_t media, uint64_t zid_hint, co
 	ret = cz_report_zones_refresh(h, media);
 	if (ret)
 		return ret;
-	ret = cz_choose_zone(dev, zid_hint, nlb, &zid);
-	if (ret)
-		return ret;
-
-	*start_slba = dev->zones[zid].wp;
-	*zid_out = zid;
 	while (done < nlb) {
 		uint64_t todo = nlb - done;
-		uint64_t zone_slba = dev->zones[zid].zslba;
+		uint64_t zone_slba;
+		uint64_t zone_free;
 		struct nvme_passthru_cmd64 cmd;
 
 		if (todo > CZ_MAX_CMD_LBAS)
 			todo = CZ_MAX_CMD_LBAS;
+		ret = cz_choose_zone(dev, zid_hint, todo, &zid);
+		if (ret)
+			return ret;
+		if (done == 0) {
+			*start_slba = dev->zones[zid].wp;
+			*zid_out = zid;
+		}
+		zone_free = dev->zones[zid].zslba + dev->zones[zid].capacity_lba -
+			    dev->zones[zid].wp;
+		if (todo > zone_free)
+			todo = zone_free;
+		zone_slba = dev->zones[zid].zslba;
 
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opcode = CZ_OPC_ZONE_APPEND;

@@ -85,6 +85,7 @@ int cz_open_zone(cz_handle_t *h, cz_media_t media, uint64_t zid);
 int cz_close_zone(cz_handle_t *h, cz_media_t media, uint64_t zid);
 int cz_finish_zone(cz_handle_t *h, cz_media_t media, uint64_t zid);
 int cz_reset_zone(cz_handle_t *h, cz_media_t media, uint64_t zid);
+int cz_reset_all_zones(cz_handle_t *h, cz_media_t media);
 
 int cz_append(cz_handle_t *h, cz_media_t media, uint64_t zid_hint, uint64_t object_id,
 	      uint32_t object_type, uint32_t object_flags, const void *buf, size_t len,

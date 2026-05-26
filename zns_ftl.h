@@ -512,6 +512,7 @@ void print_agg(struct zms_ftl *zms_ftl, int agg_len, uint64_t *agg_lpns);
 void print_lines(struct zms_ftl *zms_ftl);
 void print_zone_mapping(struct zms_ftl *zms_ftl, uint32_t zid);
 void print_ppa(struct ppa ppa);
+void zms_reset_all_namespace(struct zms_ftl *zms_ftl);
 
 void dec_free_cnt(struct zms_ftl *zms_ftl, int location);
 void inc_free_cnt(struct zms_ftl *zms_ftl, int location);

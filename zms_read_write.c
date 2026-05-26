@@ -712,6 +712,11 @@ static inline void set_maptbl_ent(struct zms_ftl *zms_ftl, uint64_t lpn, struct 
 		NVMEV_ERROR("%s lpn too large %llu / %llu\n", __func__, lpn, zms_ftl->zp.tt_lpns);
 		return;
 	}
+	if (mapped_ppa(ppa) && ppa_2_pgidx(zms_ftl, ppa) >= zms_ftl->zp.tt_ppns) {
+		NVMEV_ERROR("%s reject out-of-range ppa for lpn %llu\n", __func__, lpn);
+		print_ppa(*ppa);
+		return;
+	}
 	zms_ftl->maptbl[lpn] = *ppa;
 }
 
@@ -812,6 +817,7 @@ struct ppa get_current_page(struct zms_ftl *zms_ftl, struct zms_write_pointer *w
 			zms_ftl->pslc_full = 1;
 		else
 			zms_ftl->device_full = 1;
+		ppa.ppa = UNMAPPED_PPA;
 	}
 	// NVMEV_ASSERT(ppa.g.pl == 0);
 	return ppa;
@@ -1178,7 +1184,7 @@ static void mark_page_invalid(struct zms_ftl *zms_ftl, struct ppa *ppa)
 		NVMEV_ERROR(" ns %d %s but pg status (%d)\n", zms_ftl->zp.ns->id, __func__, pg->status);
 		NVMEV_ERROR("ppa ch %d lun %d pl %d blk %d pg %d\n", ppa->zms.ch, ppa->zms.lun, ppa->zms.pl,
 					ppa->zms.blk, ppa->zms.pg);
-		// NVMEV_ASSERT(0);
+		return;
 	}
 
 	// NVMEV_CONZONE_DEBUG("mark ppa ch %d lun %d pl %d blk %d pg %d
@@ -1401,7 +1407,8 @@ static void mark_line_free(struct zms_ftl *zms_ftl, struct zms_line *line, int i
 		struct zms_write_pointer *pslc_user_wp = zms_get_wp(zms_ftl, USER_IO, LOC_PSLC);
 		struct zms_write_pointer *gc_wp = zms_get_wp(zms_ftl, GC_IO, LOC_NORMAL);
 		struct zms_write_pointer *user_wp = zms_get_wp(zms_ftl, USER_IO, LOC_NORMAL);
-		struct zms_write_pointer *wp;
+		struct zms_write_pointer *wp = NULL;
+		struct ppa first_pg;
 		// reset write pointer
 		if (line == gc_wp->curline) {
 			wp = gc_wp;
@@ -1421,10 +1428,12 @@ static void mark_line_free(struct zms_ftl *zms_ftl, struct zms_line *line, int i
 					   location, io_type, line->id, line->parent_id);
 		}
 
-		wp->ch = 0;
-		wp->lun = 0;
-		wp->pl = 0;
-		wp->pg = 0;
+		if (!wp) {
+			NVMEV_ERROR("%s: active line has no matching write pointer\n", __func__);
+			return;
+		}
+		first_pg = get_first_page(zms_ftl, line);
+		update_write_pointer(wp, first_pg);
 	}
 
 	if (location == LOC_PSLC) {
@@ -1449,6 +1458,10 @@ static inline void check_and_refill_write_credit(struct zms_ftl *zms_ftl, int lo
 	struct zms_write_flow_control *wfc = location ? &(zms_ftl->pslc_wfc) : &(zms_ftl->wfc);
 
 	if (wfc->write_credits <= 0) {
+		if (zms_is_dual_ns(zms_ftl->zp.ns_type)) {
+			wfc->write_credits += wfc->credits_to_refill;
+			return;
+		}
 		// NVMEV_INFO("should refill write credit %ld\n", wfc->write_credits);
 		foreground_gc(zms_ftl, location);
 
@@ -2115,29 +2128,31 @@ static void erase_line(struct zms_ftl *zms_ftl, struct zms_line *line, int io_ty
 	int end_lun = start_lun + rows_per_line;
 
 	if (line->parent_id == -1) {
-		int ch, lun;
+		int ch, lun, pl;
 		for (ch = 0; ch < spp->nchs; ch++) {
 			for (lun = start_lun; lun < end_lun; lun++) {
-				e_ppa.zms.ch = ch;
-				e_ppa.zms.lun = lun;
-
 				if (lun >= spp->luns_per_ch) {
 					NVMEV_ERROR("Erase lun out of bound! lun %d max %d\n", lun, spp->luns_per_ch);
 					continue;
 				}
-				mark_block_free(zms_ftl, &e_ppa);
+				for (pl = 0; pl < spp->pls_per_lun; pl++) {
+					e_ppa.zms.ch = ch;
+					e_ppa.zms.lun = lun;
+					e_ppa.zms.pl = pl;
+					mark_block_free(zms_ftl, &e_ppa);
 
-				if (io_type != GC_IO || zms_ftl->zp.enable_gc_delay) {
-					struct nand_cmd ecmd = {
-						.type = io_type,
-						.cmd = NAND_ERASE,
-						.stime = 0,
-						.interleave_pci_dma = false,
-						.ppa = e_ppa,
-					};
-					NVMEV_CONZONE_PRINT_TIME("nsid [%d] submit nand cmd in %s 1\n",
-											 zms_ftl->zp.ns->id, __func__);
-					submit_nand_cmd(zms_ftl->ssd, &ecmd);
+					if (io_type != GC_IO || zms_ftl->zp.enable_gc_delay) {
+						struct nand_cmd ecmd = {
+							.type = io_type,
+							.cmd = NAND_ERASE,
+							.stime = 0,
+							.interleave_pci_dma = false,
+							.ppa = e_ppa,
+						};
+						NVMEV_CONZONE_PRINT_TIME("nsid [%d] submit nand cmd in %s 1\n",
+												 zms_ftl->zp.ns->id, __func__);
+						submit_nand_cmd(zms_ftl->ssd, &ecmd);
+					}
 				}
 			}
 		}
@@ -2166,13 +2181,160 @@ static void erase_line(struct zms_ftl *zms_ftl, struct zms_line *line, int io_ty
 	mark_line_free(zms_ftl, line, io_type);
 }
 
+static void reset_line_blocks(struct zms_ftl *zms_ftl, struct zms_line *line)
+{
+	struct ssdparams *spp = &zms_ftl->ssd->sp;
+	struct ppa e_ppa = get_first_page(zms_ftl, line);
+	int rows_per_line = (spp->tt_luns / spp->line_groups) / spp->nchs;
+	int start_lun = e_ppa.zms.lun;
+	int end_lun = start_lun + rows_per_line;
+
+	if (line->parent_id == -1) {
+		int ch, lun, pl;
+
+		for (ch = 0; ch < spp->nchs; ch++) {
+			for (lun = start_lun; lun < end_lun; lun++) {
+				if (lun >= spp->luns_per_ch)
+					continue;
+				for (pl = 0; pl < spp->pls_per_lun; pl++) {
+					e_ppa.zms.ch = ch;
+					e_ppa.zms.lun = lun;
+					e_ppa.zms.pl = pl;
+					mark_block_free(zms_ftl, &e_ppa);
+				}
+			}
+		}
+	} else {
+		mark_block_free(zms_ftl, &e_ppa);
+	}
+}
+
+static void reset_line_state(struct zms_line *line)
+{
+	line->ipc = 0;
+	line->vpc = 0;
+	line->rpc = 0;
+	line->pos = 0;
+	line->rsv_nextline = NULL;
+	INIT_LIST_HEAD(&line->entry);
+	line->mid.pos = 0;
+	line->mid.write_order = 0;
+	INIT_LIST_HEAD(&line->mid.entry);
+}
+
+static void reset_write_buffer_state(struct buffer *write_buffer)
+{
+	if (!write_buffer)
+		return;
+
+	for (int i = 0; i < write_buffer->pgs; i++)
+		write_buffer->lpns[i] = INVALID_LPN;
+	write_buffer->flush_data = 0;
+	write_buffer->pgs = 0;
+	write_buffer->zid = -1;
+	write_buffer->sqid = -1;
+	if (is_buffer_busy(write_buffer))
+		buffer_release(write_buffer, 0);
+}
+
+void zms_reset_all_namespace(struct zms_ftl *zms_ftl)
+{
+	struct zms_line_mgmt *lm = &zms_ftl->lm;
+	uint64_t idx;
+	int i, j;
+
+	for (idx = 0; idx < zms_ftl->zp.tt_lpns; idx++) {
+		zms_ftl->maptbl[idx].ppa = UNMAPPED_PPA;
+		zms_ftl->l2pcache_idx[idx] = -1;
+	}
+
+	for (idx = 0; idx < zms_ftl->zp.tt_ppns; idx++)
+		zms_ftl->rmap[idx] = INVALID_LPN;
+
+	if (zms_ftl->write_buffer) {
+		for (i = 0; i < zms_ftl->zp.nr_wb; i++)
+			reset_write_buffer_state(&zms_ftl->write_buffer[i]);
+	}
+
+	for (i = 0; i < zms_ftl->num_aggs; i++)
+		zms_ftl->zone_agg_pgs[i] = 0;
+
+	INIT_LIST_HEAD(&lm->free_line_list);
+	INIT_LIST_HEAD(&lm->full_line_list);
+	INIT_LIST_HEAD(&lm->pslc_free_line_list);
+	INIT_LIST_HEAD(&lm->pslc_full_line_list);
+	lm->victim_line_pq->size = 1;
+	lm->pslc_victim_line_pq->size = 1;
+	lm->free_line_cnt = 0;
+	lm->victim_line_cnt = 0;
+	lm->full_line_cnt = 0;
+	lm->pslc_free_line_cnt = 0;
+	lm->pslc_victim_line_cnt = 0;
+	lm->pslc_full_line_cnt = 0;
+
+	if (zms_ftl->migrating_line_pq)
+		zms_ftl->migrating_line_pq->size = 1;
+
+	for (i = 0; i < lm->tt_lines; i++) {
+		struct zms_line *line = &lm->lines[i];
+
+		if (line->sub_lines) {
+			reset_line_state(line);
+			for (j = 0; j < zms_ftl->ssd->sp.blks_per_line; j++) {
+				struct zms_line *subline = &line->sub_lines[j];
+				int loc;
+
+				reset_line_blocks(zms_ftl, subline);
+				reset_line_state(subline);
+				loc = get_line_location(zms_ftl, subline);
+				if (loc == LOC_PSLC) {
+					list_add_tail(&subline->entry, &lm->pslc_free_line_list);
+					lm->pslc_free_line_cnt++;
+				} else {
+					list_add_tail(&subline->entry, &lm->free_line_list);
+					lm->free_line_cnt++;
+				}
+			}
+		} else {
+			int loc;
+
+			reset_line_blocks(zms_ftl, line);
+			reset_line_state(line);
+			loc = get_line_location(zms_ftl, line);
+			if (loc == LOC_PSLC) {
+				list_add_tail(&line->entry, &lm->pslc_free_line_list);
+				lm->pslc_free_line_cnt++;
+			} else {
+				list_add_tail(&line->entry, &lm->free_line_list);
+				lm->free_line_cnt++;
+			}
+		}
+	}
+
+	zms_ftl->pslc_wp = (struct zms_write_pointer){ .loc = LOC_PSLC };
+	zms_ftl->pslc_gc_wp = (struct zms_write_pointer){ .loc = LOC_PSLC };
+	zms_ftl->wp = (struct zms_write_pointer){ .loc = LOC_NORMAL };
+	zms_ftl->gc_wp = (struct zms_write_pointer){ .loc = LOC_NORMAL };
+	zms_ftl->pslc_wfc.write_credits = zms_ftl->zp.pslc_pgs_per_line;
+	zms_ftl->pslc_wfc.credits_to_refill = zms_ftl->zp.pslc_pgs_per_line;
+	zms_ftl->wfc.write_credits = zms_ftl->zp.pgs_per_line;
+	zms_ftl->wfc.credits_to_refill = zms_ftl->zp.pgs_per_line;
+	zms_ftl->device_full = 0;
+	zms_ftl->pslc_full = 0;
+	zms_ftl->pending_for_migrating = 0;
+	zms_ftl->gc_agg_len = 0;
+	zms_ftl->last_slba = 0;
+	zms_ftl->last_nlb = 0;
+	zms_ftl->nopg_last_lpn = 0;
+}
+
 static void erase_linked_lines(struct zms_ftl *zms_ftl, struct zms_line *first_line, int io_type)
 {
 	while (first_line) {
 		struct zms_line *target = first_line;
 		first_line = target->rsv_nextline;
-		if (target->ipc + target->rpc == target->pgs_per_line) {
-			erase_line(zms_ftl, target, USER_IO);
+		if (target->vpc == 0 && (target->ipc || target->rpc)) {
+			erase_line(zms_ftl, target, io_type);
 			NVMEV_CONZONE_GC_DEBUG("%s: ns %d  mark lined line(%d,%d) free success!\n", __func__,
 								   zms_ftl->zp.ns->id, target->parent_id, target->id);
 		} else {
@@ -3709,14 +3871,14 @@ void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid)
 {
 	uint64_t slpn = zone_to_slpn((struct zns_ftl *)(&(*zms_ftl)), zid);
 	uint64_t elpn = slpn + zms_ftl->zp.pgs_per_zone - 1;
-	struct buffer *write_buffer = __zms_wb_get(zms_ftl, slpn);
+	struct buffer *write_buffer = zms_find_zone_buffer(zms_ftl, zid);
 	uint64_t lpn;
 	struct ppa ppa;
-	size_t bufs_to_release = 0;
 	struct zms_line *line = NULL, *first_line = NULL;
 	uint64_t r_slpn = elpn + 1, r_elpn = slpn;
 	int pslc_invalid = 0;
 	int normal_invalid = 0;
+	int reserved_invalid = 0;
 
 	for (lpn = slpn; lpn <= elpn; lpn++) {
 		ppa = get_maptbl_ent(zms_ftl, lpn);
@@ -3736,26 +3898,26 @@ void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid)
 			line = get_line(zms_ftl, &ppa);
 			if (first_line == NULL)
 				first_line = line;
-			if (line->ipc + line->rpc == line->pgs_per_line && line->rsv_nextline == NULL) {
+			if (line->vpc == 0 && line->rsv_nextline == NULL) {
 				erase_linked_lines(zms_ftl, first_line, USER_IO);
 				first_line = NULL;
 			}
 		} else {
-			if (write_buffer && __zms_wb_check(zms_ftl, write_buffer, slpn) == SUCCESS &&
-				__zms_wb_hit(zms_ftl, write_buffer, lpn)) {
-				bufs_to_release = write_buffer->flush_data;
+			if (IS_RSV_PPA(zms_ftl->maptbl[lpn])) {
+				zms_ftl->maptbl[lpn].ppa = UNMAPPED_PPA;
+				reserved_invalid++;
 			}
-			break;
 		}
 	}
 
 	// erase lines
-	if (first_line && first_line->ipc + first_line->rpc == first_line->pgs_per_line) {
+	if (first_line) {
 		erase_linked_lines(zms_ftl, first_line, USER_IO);
 	}
 
-	// different zones should not share a write buffer
-	if (write_buffer && bufs_to_release) {
+	// Reset discards any buffered data for this zone.  Do not use __zms_wb_get()
+	// here because it can assign a clean buffer while reset-all is walking zones.
+	if (write_buffer) {
 		for (int i = 0; i < write_buffer->pgs; i++) {
 			write_buffer->lpns[i] = INVALID_LPN;
 		}
@@ -3763,14 +3925,14 @@ void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid)
 		write_buffer->pgs = 0;
 		write_buffer->zid = -1;
 		write_buffer->sqid = -1;
+		if (is_buffer_busy(write_buffer))
+			buffer_release(write_buffer, 0);
 		NVMEV_CONZONE_GC_DEBUG("ns %d Evict write buffer\n", zms_ftl->zp.ns->id);
 	}
 
 	zms_ftl->zone_agg_pgs[zid] = 0;
-	if (pslc_invalid || normal_invalid || bufs_to_release) {
-		zms_ftl->pslc_full = 0;
-		zms_ftl->device_full = 0;
-	}
+	zms_ftl->pslc_full = 0;
+	zms_ftl->device_full = 0;
 	zms_ftl->zone_reset_cnt++;
 	NVMEV_CONZONE_GC_DEBUG("ns %d Zone %lld (%lld-%lld) vs [%lld-%lld] Reset. pSLC lines: "
 						   "%d/%d/%d/%d, normal lines %d/%d/%d/%d "
@@ -3780,8 +3942,9 @@ void zone_reset(struct zms_ftl *zms_ftl, uint64_t zid, int sqid)
 						   zms_ftl->lm.pslc_victim_line_cnt, zms_ftl->lm.pslc_tt_lines,
 						   zms_ftl->lm.free_line_cnt, zms_ftl->lm.full_line_cnt,
 						   zms_ftl->lm.victim_line_cnt, zms_ftl->lm.tt_lines);
-	NVMEV_CONZONE_GC_DEBUG("ns %d %s : zid %lld pslc invalid %d normal invalid %d\n",
-						   zms_ftl->zp.ns->id, __func__, zid, pslc_invalid, normal_invalid);
+	NVMEV_CONZONE_GC_DEBUG("ns %d %s : zid %lld pslc invalid %d normal invalid %d reserved %d\n",
+						   zms_ftl->zp.ns->id, __func__, zid, pslc_invalid, normal_invalid,
+						   reserved_invalid);
 }
 
 bool block_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)

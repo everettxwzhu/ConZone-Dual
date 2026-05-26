@@ -276,8 +276,25 @@ void zns_zmgmt_send(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev
 	uint64_t zid = lba_to_zone(zns_ftl, slba);
 
 	if (select_all) {
-		for (zid = 0; zid < zns_ftl->zp.nr_zones; zid++)
-			__zmgmt_send(zns_ftl, zone_to_slba(zns_ftl, zid), action, option, req->sq_id);
+		if (action == ZSA_RESET_ZONE) {
+			for (zid = 0; zid < zns_ftl->zp.nr_zones; zid++) {
+				memset(get_storage_addr_from_zid(zns_ftl, zid), 0, zns_ftl->zp.zone_size);
+				zns_ftl->zone_descs[zid].wp = zns_ftl->zone_descs[zid].zslba;
+				zns_ftl->zone_descs[zid].zrwav = 0;
+				change_zone_state(zns_ftl, zid, ZONE_STATE_EMPTY);
+				if (zns_ftl->zp.zrwa_buffer_size)
+					buffer_refill(&zns_ftl->zrwa_buffer[zid]);
+			}
+			for (uint32_t type = 0; type < RES_TYPE_COUNT; type++)
+				zns_ftl->res_infos[type].acquired_cnt = 0;
+#if (IS_CONZONE)
+			if (is_zoned(zns_ftl->zp.ns_type))
+				zms_reset_all_namespace((struct zms_ftl *)(&(*zns_ftl)));
+#endif
+		} else {
+			for (zid = 0; zid < zns_ftl->zp.nr_zones; zid++)
+				__zmgmt_send(zns_ftl, zone_to_slba(zns_ftl, zid), action, option, req->sq_id);
+		}
 	} else {
 		status = __zmgmt_send(zns_ftl, slba, action, option, req->sq_id);
 	}

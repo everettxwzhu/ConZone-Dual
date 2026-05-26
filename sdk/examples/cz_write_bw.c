@@ -42,24 +42,7 @@ static const char *media_name(cz_media_t media)
 
 static int reset_all_zones(cz_handle_t *h, cz_media_t media)
 {
-	cz_zone_info_t *zones = NULL;
-	size_t nr_zones = 0;
-	int ret;
-
-	ret = cz_report_zones(h, media, &zones, &nr_zones);
-	if (ret)
-		return ret;
-
-	for (size_t i = 0; i < nr_zones; i++) {
-		ret = cz_reset_zone(h, media, zones[i].zid);
-		if (ret) {
-			cz_free(zones);
-			return ret;
-		}
-	}
-
-	cz_free(zones);
-	return 0;
+	return cz_reset_all_zones(h, media);
 }
 
 static int run_one(cz_handle_t *h, const bench_opts_t *opts, cz_media_t media, void *buf)
