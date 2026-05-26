@@ -3261,7 +3261,7 @@ static bool handle_read_request(struct zms_ftl *zms_ftl, struct nvmev_request *r
 	return true;
 }
 
-static bool zms_zone_start_lba(struct zms_ftl *zms_ftl, uint64_t slba, uint32_t *zid)
+static bool zms_lba_to_zid_checked(struct zms_ftl *zms_ftl, uint64_t slba, uint32_t *zid)
 {
 	if (!is_zoned(zms_ftl->zp.ns_type))
 		return false;
@@ -3270,6 +3270,14 @@ static bool zms_zone_start_lba(struct zms_ftl *zms_ftl, uint64_t slba, uint32_t 
 
 	*zid = lba_to_zone((struct zns_ftl *)(&(*zms_ftl)), slba);
 	if (*zid >= zms_ftl->zp.nr_zones)
+		return false;
+
+	return true;
+}
+
+static bool zms_zone_start_lba(struct zms_ftl *zms_ftl, uint64_t slba, uint32_t *zid)
+{
+	if (!zms_lba_to_zid_checked(zms_ftl, slba, zid))
 		return false;
 
 	return zone_to_slba((struct zns_ftl *)(&(*zms_ftl)), *zid) == slba;
@@ -3325,31 +3333,63 @@ static uint32_t zms_check_target_zone_buffer(struct zms_ftl *zms_ftl, uint32_t z
 	return NVME_SC_SUCCESS;
 }
 
-static uint32_t zms_open_empty_zone_for_copy(struct zms_ftl *zms_ftl, uint32_t zid)
+static uint32_t zms_prepare_target_zone_for_copy(struct zms_ftl *zms_ftl, uint32_t zid,
+												 uint64_t dst_slba, uint64_t copy_nlb)
 {
 	struct zone_descriptor *zone_descs = zms_ftl->zone_descs;
+	struct zone_descriptor *zone = &zone_descs[zid];
 
-	if (zone_descs[zid].state != ZONE_STATE_EMPTY || zone_descs[zid].wp != zone_descs[zid].zslba)
+	if (copy_nlb == 0)
+		return zms_check_target_zone_buffer(zms_ftl, zid);
+
+	if (dst_slba != zone->wp)
+		return NVME_SC_ZNS_INVALID_WRITE;
+
+	if (dst_slba + copy_nlb > zone->zslba + zone->zone_capacity)
 		return NVME_SC_INVALID_FIELD;
 
-	if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE))
-		return NVME_SC_ZNS_NO_ACTIVE_ZONE;
-	if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE))
-		return NVME_SC_ZNS_NO_OPEN_ZONE;
+	switch (zone->state) {
+	case ZONE_STATE_EMPTY:
+		if (dst_slba != zone->zslba)
+			return NVME_SC_ZNS_INVALID_WRITE;
+		if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE))
+			return NVME_SC_ZNS_NO_ACTIVE_ZONE;
+		if (is_zone_resource_full((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE))
+			return NVME_SC_ZNS_NO_OPEN_ZONE;
 
-	acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
-	if (acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE) == false) {
-		release_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
-		return NVME_SC_ZNS_NO_OPEN_ZONE;
+		acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
+		if (acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE) == false) {
+			release_zone_resource((struct zns_ftl *)(&(*zms_ftl)), ACTIVE_ZONE);
+			return NVME_SC_ZNS_NO_OPEN_ZONE;
+		}
+
+		change_zone_state((struct zns_ftl *)(&(*zms_ftl)), zid, ZONE_STATE_OPENED_IMPL);
+		break;
+	case ZONE_STATE_CLOSED:
+		if (acquire_zone_resource((struct zns_ftl *)(&(*zms_ftl)), OPEN_ZONE) == false)
+			return NVME_SC_ZNS_NO_OPEN_ZONE;
+		change_zone_state((struct zns_ftl *)(&(*zms_ftl)), zid, ZONE_STATE_OPENED_IMPL);
+		break;
+	case ZONE_STATE_OPENED_IMPL:
+	case ZONE_STATE_OPENED_EXPL:
+		break;
+	case ZONE_STATE_FULL:
+		return NVME_SC_ZNS_ERR_FULL;
+	case ZONE_STATE_READ_ONLY:
+		return NVME_SC_ZNS_ERR_READ_ONLY;
+	case ZONE_STATE_OFFLINE:
+		return NVME_SC_ZNS_ERR_OFFLINE;
+	default:
+		return NVME_SC_ZNS_INVALID_ZONE_OPERATION;
 	}
 
-	change_zone_state((struct zns_ftl *)(&(*zms_ftl)), zid, ZONE_STATE_OPENED_IMPL);
 	return NVME_SC_SUCCESS;
 }
 
 static uint32_t zms_validate_cross_ns_copy(struct zms_ftl *src_ftl, struct zms_ftl *dst_ftl,
 										   uint32_t src_zid, uint32_t dst_zid,
-										   uint64_t *copy_nlb)
+										   uint64_t src_slba, uint64_t dst_slba,
+										   uint64_t requested_nlb, uint64_t *copy_nlb)
 {
 	struct zone_descriptor *src_zone = &src_ftl->zone_descs[src_zid];
 	struct zone_descriptor *dst_zone = &dst_ftl->zone_descs[dst_zid];
@@ -3383,17 +3423,27 @@ static uint32_t zms_validate_cross_ns_copy(struct zms_ftl *src_ftl, struct zms_f
 		return NVME_SC_INTERNAL;
 	}
 
-	*copy_nlb = src_zone->wp - src_zone->zslba;
-	if (dst_zone->state != ZONE_STATE_EMPTY || dst_zone->wp != dst_zone->zslba)
+	if (src_slba < src_zone->zslba || src_slba > src_zone->wp)
 		return NVME_SC_INVALID_FIELD;
 
+	if (requested_nlb == 0)
+		*copy_nlb = src_zone->wp - src_slba;
+	else
+		*copy_nlb = requested_nlb;
+
 	if (*copy_nlb == 0)
-		return zms_check_target_zone_buffer(dst_ftl, dst_zid);
+		return zms_prepare_target_zone_for_copy(dst_ftl, dst_zid, dst_slba, 0);
 
 	if ((*copy_nlb % spp->secs_per_pg) != 0)
 		return NVME_SC_INVALID_FIELD;
 
-	if (*copy_nlb > dst_zone->zone_capacity)
+	if (src_slba + *copy_nlb > src_zone->wp)
+		return NVME_SC_INVALID_FIELD;
+
+	if (dst_slba < dst_zone->zslba || dst_slba != dst_zone->wp)
+		return NVME_SC_ZNS_INVALID_WRITE;
+
+	if (dst_slba + *copy_nlb > dst_zone->zslba + dst_zone->zone_capacity)
 		return NVME_SC_INVALID_FIELD;
 
 	return zms_check_target_zone_buffer(dst_ftl, dst_zid);
@@ -3445,6 +3495,7 @@ bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint32_t dst_nsid = cmd->dst_nsid;
 	uint64_t src_slba = cmd->src_slba;
 	uint64_t dst_slba = ((uint64_t)cmd->dst_slba_hi << 32) | cmd->dst_slba_lo;
+	uint64_t requested_nlb = cmd->cdw15;
 	uint32_t src_zid, dst_zid;
 	uint64_t copy_nlb = 0, copy_pgs = 0, copied_pgs = 0;
 	uint64_t src_slpn, dst_slpn;
@@ -3459,8 +3510,8 @@ bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	ret->result1 = 0;
 	ret->nsecs_target = req->nsecs_start;
 
-	if (cmd->cdw15 != 0 || src_nsid == 0 || dst_nsid == 0 ||
-		src_nsid > nvmev_vdev->nr_ns || dst_nsid > nvmev_vdev->nr_ns) {
+	if (src_nsid == 0 || dst_nsid == 0 || src_nsid > nvmev_vdev->nr_ns ||
+		dst_nsid > nvmev_vdev->nr_ns) {
 		status = NVME_SC_INVALID_FIELD;
 		goto out;
 	}
@@ -3488,8 +3539,8 @@ bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		goto out;
 	}
 
-	if (!zms_zone_start_lba(src_ftl, src_slba, &src_zid) ||
-		!zms_zone_start_lba(dst_ftl, dst_slba, &dst_zid)) {
+	if (!zms_lba_to_zid_checked(src_ftl, src_slba, &src_zid) ||
+		!zms_lba_to_zid_checked(dst_ftl, dst_slba, &dst_zid)) {
 		status = NVME_SC_INVALID_FIELD;
 		goto out;
 	}
@@ -3499,7 +3550,8 @@ bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		goto out;
 	}
 
-	status = zms_validate_cross_ns_copy(src_ftl, dst_ftl, src_zid, dst_zid, &copy_nlb);
+	status = zms_validate_cross_ns_copy(src_ftl, dst_ftl, src_zid, dst_zid, src_slba, dst_slba,
+									   requested_nlb, &copy_nlb);
 	if (status != NVME_SC_SUCCESS)
 		goto out;
 
@@ -3532,7 +3584,7 @@ bool zms_cross_ns_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		goto out;
 	}
 
-	status = zms_open_empty_zone_for_copy(dst_ftl, dst_zid);
+	status = zms_prepare_target_zone_for_copy(dst_ftl, dst_zid, dst_slba, copy_nlb);
 	if (status != NVME_SC_SUCCESS)
 		goto out;
 

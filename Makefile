@@ -15,6 +15,14 @@ clean:
 	   $(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 	   rm -f cscope.out tags nvmev.S
 
+.PHONY: sdk
+sdk:
+	$(MAKE) -C sdk
+
+.PHONY: sdk-clean
+sdk-clean:
+	$(MAKE) -C sdk clean
+
 .PHONY: cscope
 cscope:
 		cscope -b -R
